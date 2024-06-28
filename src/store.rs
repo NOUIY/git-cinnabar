@@ -4,14 +4,14 @@
 
 use std::borrow::Cow;
 use std::cell::{Cell, OnceCell, Ref, RefCell, RefMut};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::hash::Hash;
 use std::io::{copy, BufRead, BufReader, Read, Write};
 use std::iter::{repeat, IntoIterator};
 use std::mem;
 use std::num::NonZeroU32;
-use std::os::raw::c_int;
+use std::os::raw::{c_char, c_int, c_ulong};
 use std::process::{Command, Stdio};
 use std::ptr;
 use std::sync::Mutex;
@@ -34,7 +34,10 @@ use crate::cinnabar::{
     GitChangesetId, GitChangesetMetadataId, GitFileId, GitFileMetadataId, GitManifestId,
     GitManifestTree, GitManifestTreeId,
 };
-use crate::git::{BlobId, CommitId, GitObjectId, GitOid, RecursedTreeEntry, TreeId, TreeIsh};
+use crate::git::{
+    BlobId, Commit, CommitId, GitObjectId, GitOid, RawBlob, RawCommit, RawTree, RecursedTreeEntry,
+    TreeId, TreeIsh,
+};
 use crate::graft::{graft, grafted, replace_map_tablesize, GraftError};
 use crate::hg::{HgChangesetId, HgFileAttr, HgFileId, HgManifestId, HgObjectId};
 use crate::hg_bundle::{
@@ -45,17 +48,17 @@ use crate::hg_data::{hash_data, GitAuthorship, HgAuthorship, HgCommitter};
 use crate::libcinnabar::{git_notes_tree, hg_notes_tree, strslice, strslice_mut, AsStrSlice};
 use crate::libgit::{
     config_get_value, die, for_each_ref_in, get_oid_blob, object_entry, object_id, object_type,
-    resolve_ref, Commit, FileMode, RawBlob, RawCommit, RawTree, RefTransaction,
+    resolve_ref, FfiBox, FileMode, RefTransaction,
 };
 use crate::oid::ObjectId;
 use crate::progress::{progress_enabled, Progress};
 use crate::tree_util::{diff_by_path, merge_join_by_path, Empty, ParseTree, RecurseTree, WithPath};
 use crate::util::{
-    FromBytes, ImmutBString, OsStrExt, RcExt, RcSlice, RcSliceBuilder, ReadExt, SliceExt, ToBoxed,
-    Transpose,
+    FromBytes, ImmutBString, IteratorExt, OsStrExt, RcExt, RcSlice, RcSliceBuilder, ReadExt,
+    SliceExt, ToBoxed, Transpose,
 };
 use crate::xdiff::{apply, textdiff, PatchInfo};
-use crate::{check_enabled, Checks};
+use crate::{check_enabled, experiment, has_compat, Checks, Compat, Experiments};
 
 pub const REFS_PREFIX: &str = "refs/cinnabar/";
 pub const REPLACE_REFS_PREFIX: &str = "refs/cinnabar/replace/";
@@ -189,6 +192,15 @@ macro_rules! hg2git {
                 store
                     .hg2git_mut()
                     .get_note(self.into())
+                    .map(|o| $g::from_raw_bytes(o.as_raw_bytes()).unwrap())
+            }
+        }
+
+        impl crate::oid::Abbrev<$h> {
+            pub fn to_git(self, store: &Store) -> Option<$g> {
+                store
+                    .hg2git_mut()
+                    .get_note_abbrev(self.into())
                     .map(|o| $g::from_raw_bytes(o.as_raw_bytes()).unwrap())
             }
         }
@@ -372,7 +384,7 @@ impl GeneratedGitChangesetMetadata {
             files,
             patch: None,
         };
-        let new = RawHgChangeset::from_metadata(store, commit, &temp)?;
+        let new = RawHgChangeset::from_metadata_(store, commit, &temp, false)?;
         if **raw_changeset != *new {
             // TODO: produce a better patch (byte_diff). In the meanwhile, we
             // do an approximation by taking the by-line diff from textdiff
@@ -542,6 +554,15 @@ impl RawHgChangeset {
         commit: &Commit,
         metadata: &GitChangesetMetadata<B>,
     ) -> Option<Self> {
+        Self::from_metadata_(store, commit, metadata, true)
+    }
+
+    fn from_metadata_<B: AsRef<[u8]>>(
+        store: &Store,
+        commit: &Commit,
+        metadata: &GitChangesetMetadata<B>,
+        handle_changeset_conflict: bool,
+    ) -> Option<Self> {
         let HgAuthorship {
             author: mut hg_author,
             timestamp: hg_timestamp,
@@ -588,30 +609,30 @@ impl RawHgChangeset {
             mem::swap(&mut changeset, &mut patched);
         }
 
-        // Adjust for `handle_changeset_conflict`.
-        // TODO: when creating the git2hg metadata moves to Rust, we can
-        // create a patch instead, which would be handled above instead of
-        // manually here.
-        let node = metadata.changeset_id();
-        if !node.is_null() {
-            while changeset[changeset.len() - 1] == b'\0' {
-                let mut hash = HgChangesetId::create();
-                let mut parents = commit
-                    .parents()
-                    .iter()
-                    .map(|p| GitChangesetId::from_unchecked(*p).to_hg(store))
-                    .chain(repeat(Some(HgChangesetId::NULL)))
-                    .take(2)
-                    .collect::<Option<Vec<_>>>()?;
-                parents.sort();
-                for p in parents {
-                    hash.update(p.as_raw_bytes());
+        // Adjust for old commits created by now removed
+        // `handle_changeset_conflict`.
+        if handle_changeset_conflict {
+            let node = metadata.changeset_id();
+            if !node.is_null() {
+                while changeset[changeset.len() - 1] == b'\0' {
+                    let mut hash = HgChangesetId::create();
+                    let mut parents = commit
+                        .parents()
+                        .iter()
+                        .map(|p| GitChangesetId::from_unchecked(*p).to_hg(store))
+                        .chain(repeat(Some(HgChangesetId::NULL)))
+                        .take(2)
+                        .collect::<Option<Vec<_>>>()?;
+                    parents.sort();
+                    for p in parents {
+                        hash.update(p.as_raw_bytes());
+                    }
+                    hash.update(&changeset);
+                    if hash.finalize() == node {
+                        break;
+                    }
+                    changeset.pop();
                 }
-                hash.update(&changeset);
-                if hash.finalize() == node {
-                    break;
-                }
-                changeset.pop();
             }
         }
         Some(RawHgChangeset(changeset.into()))
@@ -842,39 +863,23 @@ struct ChangesetInfo {
 #[derive(Debug)]
 pub struct Dag<N, T> {
     // 4 billion nodes ought to be enough for anybody.
-    ids: BTreeMap<N, DagNodeId>,
+    ids: HashMap<N, DagNodeId>,
     dag: Vec<DagNode<N, T>>,
 }
 
-pub enum Traversal {
-    Parents,
-    Children,
-}
-
-impl<N: Ord + Copy, T> Dag<N, T> {
+impl<N: Hash + Eq + Copy, T> Dag<N, T> {
     pub fn new() -> Self {
         Dag {
-            ids: BTreeMap::new(),
+            ids: HashMap::new(),
             dag: Vec::new(),
         }
     }
 
-    pub fn add<F: FnMut(DagNodeId, &mut T)>(
-        &mut self,
-        node: N,
-        parents: &[N],
-        data: T,
-        mut cb: F,
-    ) -> DagNodeId {
+    pub fn add(&mut self, node: N, parents: &[N], data: T) -> DagNodeId {
         assert!(parents.len() <= 2);
         let parents = parents
             .iter()
-            .filter_map(|&p| {
-                self.get_mut(p).map(|(id, data)| {
-                    cb(id, data);
-                    id
-                })
-            })
+            .filter_map(|&p| self.get_mut(p).map(|(id, _)| id))
             .collect_vec();
         let id = DagNodeId::try_from_offset(self.dag.len()).unwrap();
         assert!(self.ids.insert(node, id).is_none());
@@ -904,57 +909,271 @@ impl<N: Ord + Copy, T> Dag<N, T> {
         (&node.node, &node.data)
     }
 
-    pub fn traverse_mut(
-        &mut self,
-        start: N,
-        direction: Traversal,
-        cb: impl FnMut(N, &mut T) -> bool,
-    ) {
-        match (direction, self.ids.get(&start)) {
-            (Traversal::Parents, Some(&start)) => self.traverse_parents_mut(start, cb),
-            (Traversal::Children, Some(&start)) => self.traverse_children_mut(start, cb),
-            _ => {}
+    pub fn traverse_parents(
+        &self,
+        starts: &[N],
+        mut follow_parents: impl FnMut(N, &T) -> bool,
+    ) -> impl Iterator<Item = (&N, &T)> {
+        let starts = starts
+            .iter()
+            .filter_map(|n| self.ids.get(n).map(|x| x.to_offset()))
+            .sorted()
+            .collect_vec();
+        let limit = starts.last().map_or(0, |x| x + 1);
+        let mut smallest = starts.first().copied().unwrap_or(0);
+        let mut parents = BitVec::from_elem(limit, false);
+        for start in starts {
+            parents.set(start, true);
         }
-    }
-
-    fn traverse_parents_mut(&mut self, start: DagNodeId, mut cb: impl FnMut(N, &mut T) -> bool) {
-        let mut queue = VecDeque::from([start]);
-        let mut seen = BitVec::from_elem(self.ids.len(), false);
-        while let Some(id) = queue.pop_front() {
-            seen.set(id.to_offset(), true);
-            let node = &mut self.dag[id.to_offset()];
-            if cb(node.node, &mut node.data) {
-                for id in [node.parent1, node.parent2].into_iter().flatten() {
-                    if !seen[id.to_offset()] {
-                        queue.push_back(id);
+        self.dag[..limit]
+            .iter()
+            .enumerate()
+            .rev()
+            .filter_map_while(move |(idx, node)| {
+                if parents[idx] {
+                    if follow_parents(node.node, &node.data) {
+                        for id in [node.parent1, node.parent2].into_iter().flatten() {
+                            let idx = id.to_offset();
+                            parents.set(idx, true);
+                            if idx < smallest {
+                                smallest = idx;
+                            }
+                        }
                     }
+                    Ok((&node.node, &node.data))
+                } else if idx < smallest {
+                    // Short-circuit when there aren't any new parents to find.
+                    Err(true)
+                } else {
+                    Err(false)
                 }
-            }
-        }
+            })
     }
 
-    fn traverse_children_mut(&mut self, start: DagNodeId, mut cb: impl FnMut(N, &mut T) -> bool) {
-        let mut seen = BitVec::from_elem(self.ids.len() - start.to_offset(), false);
-        for (idx, node) in self.dag[start.to_offset()..].iter_mut().enumerate() {
-            if (idx == 0
-                || [node.parent1, node.parent2]
+    pub fn traverse_children(
+        &self,
+        starts: &[N],
+        mut follow_children: impl FnMut(N, &T) -> bool,
+    ) -> impl Iterator<Item = (&N, &T)> {
+        let mut starts = starts
+            .iter()
+            .map(|n| self.ids.get(n).copied())
+            .sorted_by(|x, y| y.cmp(x))
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default();
+        let first = starts
+            .last()
+            .map_or_else(|| self.ids.len(), |start| start.to_offset());
+        let mut seen = BitVec::from_elem(self.ids.len() - first, false);
+        self.dag
+            .iter()
+            .enumerate()
+            .skip(first)
+            .filter_map(move |(idx, node)| {
+                let is_start = starts
+                    .last()
+                    .filter(|next_start| idx == next_start.to_offset())
+                    .is_some();
+                if is_start {
+                    starts.pop();
+                }
+                if is_start
+                    || [node.parent1, node.parent2]
+                        .into_iter()
+                        .flatten()
+                        .any(|id| id.to_offset() >= first && seen[id.to_offset() - first])
+                {
+                    if follow_children(node.node, &node.data) {
+                        seen.set(idx - first, true);
+                    }
+                    Some((&node.node, &node.data))
+                } else {
+                    None
+                }
+            })
+    }
+
+    pub fn heads(
+        &self,
+        mut interesting: impl FnMut(N, &T) -> bool,
+    ) -> impl Iterator<Item = (&N, &T)> {
+        let mut parents = BitVec::from_elem(self.ids.len(), false);
+        self.dag
+            .iter()
+            .enumerate()
+            .rev()
+            .filter_map(move |(idx, node)| {
+                if interesting(node.node, &node.data) {
+                    for id in [node.parent1, node.parent2].into_iter().flatten() {
+                        parents.set(id.to_offset(), true);
+                    }
+                    (!parents[idx]).then_some((&node.node, &node.data))
+                } else {
+                    None
+                }
+            })
+    }
+
+    pub fn roots(
+        &self,
+        mut interesting: impl FnMut(N, &T) -> bool,
+    ) -> impl Iterator<Item = (&N, &T)> {
+        let mut seen = BitVec::from_elem(self.ids.len(), false);
+        self.dag.iter().enumerate().filter_map(move |(idx, node)| {
+            if interesting(node.node, &node.data) {
+                seen.set(idx, true);
+                if [node.parent1, node.parent2]
                     .into_iter()
                     .flatten()
-                    .any(|id| id >= start && seen[id.to_offset() - start.to_offset()]))
-                && cb(node.node, &mut node.data)
-            {
-                seen.set(idx, true);
+                    .filter(|id| seen[id.to_offset()])
+                    .count()
+                    == 0
+                {
+                    return Some((&node.node, &node.data));
+                }
             }
-        }
+            None
+        })
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&N, &T)> {
         self.dag.iter().map(|node| (&node.node, &node.data))
     }
+}
 
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&N, &mut T)> {
-        self.dag.iter_mut().map(|node| (&node.node, &mut node.data))
-    }
+#[test]
+fn test_dag() {
+    let mut dag = Dag::new();
+    dag.add("a", &[], ());
+    dag.add("b", &["a"], ());
+    dag.add("c", &["b"], ());
+    dag.add("d", &["c"], ());
+    dag.add("e", &[], ());
+    dag.add("f", &["e"], ());
+    dag.add("g", &["f"], ());
+    dag.add("h", &["d", "g"], ());
+    dag.add("i", &["c", "g"], ());
+    dag.add("j", &["c", "g"], ());
+
+    let result = dag
+        .traverse_children(&["a"], |_, ()| false)
+        .map(|(n, _)| n)
+        .join("");
+    assert_eq!(result, "a");
+
+    let result = dag
+        .traverse_children(&["a"], |_, ()| true)
+        .map(|(n, _)| n)
+        .join("");
+    assert_eq!(result, "abcdhij");
+
+    let result = dag
+        .traverse_children(&["c"], |_, ()| true)
+        .map(|(n, _)| n)
+        .join("");
+    assert_eq!(result, "cdhij");
+
+    let result = dag
+        .traverse_children(&["d"], |_, ()| true)
+        .map(|(n, _)| n)
+        .join("");
+    assert_eq!(result, "dh");
+
+    let result = dag
+        .traverse_children(&["e"], |_, ()| true)
+        .map(|(n, _)| n)
+        .join("");
+    assert_eq!(result, "efghij");
+
+    let result = dag
+        .traverse_children(&["f"], |_, ()| true)
+        .map(|(n, _)| n)
+        .join("");
+    assert_eq!(result, "fghij");
+
+    let result = dag
+        .traverse_children(&["a"], |node, ()| node <= "g")
+        .map(|(n, _)| n)
+        .join("");
+    assert_eq!(result, "abcdhij");
+
+    let result = dag
+        .traverse_children(&["a", "e"], |_, ()| true)
+        .map(|(n, _)| n)
+        .join("");
+    assert_eq!(result, "abcdefghij");
+
+    let result = dag
+        .traverse_children(&["a", "e"], |node, ()| node <= "g")
+        .map(|(n, _)| n)
+        .join("");
+    assert_eq!(result, "abcdefghij");
+
+    let result = dag
+        .traverse_children(&["a", "f"], |node, ()| "abcf".contains(node))
+        .map(|(n, _)| n)
+        .join("");
+    assert_eq!(result, "abcdfgij");
+
+    let result = dag
+        .traverse_parents(&["j"], |_, ()| false)
+        .map(|(n, _)| n)
+        .join("");
+    assert_eq!(result, "j");
+
+    let result = dag
+        .traverse_parents(&["j"], |_, ()| true)
+        .map(|(n, _)| n)
+        .join("");
+    assert_eq!(result, "jgfecba");
+
+    let result = dag
+        .traverse_parents(&["a"], |_, ()| true)
+        .map(|(n, _)| n)
+        .join("");
+    assert_eq!(result, "a");
+
+    let result = dag
+        .traverse_parents(&["j"], |node, ()| node >= "d")
+        .map(|(n, _)| n)
+        .join("");
+    assert_eq!(result, "jgfec");
+
+    let result = dag
+        .traverse_parents(&["j"], |node, ()| node >= "c")
+        .map(|(n, _)| n)
+        .join("");
+    assert_eq!(result, "jgfecb");
+
+    let result = dag
+        .traverse_parents(&["j", "h"], |node, ()| node >= "c")
+        .map(|(n, _)| n)
+        .join("");
+    assert_eq!(result, "jhgfedcb");
+
+    let result = dag.heads(|_, _| true).map(|(n, _)| n).join("");
+    assert_eq!(result, "jih");
+
+    let result = dag.heads(|node, _| node <= "i").map(|(n, _)| n).join("");
+    assert_eq!(result, "ih");
+
+    let result = dag.heads(|node, _| node <= "h").map(|(n, _)| n).join("");
+    assert_eq!(result, "h");
+
+    let result = dag.heads(|node, _| node <= "g").map(|(n, _)| n).join("");
+    assert_eq!(result, "gd");
+
+    let result = dag.roots(|_, _| true).map(|(n, _)| n).join("");
+    assert_eq!(result, "ae");
+
+    let result = dag.roots(|node, _| node >= "b").map(|(n, _)| n).join("");
+    assert_eq!(result, "be");
+
+    let result = dag.roots(|node, _| node >= "e").map(|(n, _)| n).join("");
+    assert_eq!(result, "e");
+
+    let result = dag.roots(|node, _| node >= "h").map(|(n, _)| n).join("");
+    assert_eq!(result, "hij");
 }
 
 #[derive(Debug)]
@@ -989,13 +1208,16 @@ impl ChangesetHeads {
             has_children: false,
             branch: BString::from(branch),
         };
-        let id = self.dag.add(cs, parents, data, |parent_id, parent_data| {
-            parent_data.has_children = true;
-            if parent_data.branch == branch {
-                self.heads.remove(&parent_id);
-            }
-        });
+        let id = self.dag.add(cs, parents, data);
         self.heads.insert(id);
+        for parent in parents {
+            if let Some((parent_id, parent_data)) = self.dag.get_mut(*parent) {
+                parent_data.has_children = true;
+                if parent_data.branch == branch {
+                    self.heads.remove(&parent_id);
+                }
+            }
+        }
     }
 
     pub fn branch_heads(&self) -> impl Iterator<Item = (&HgChangesetId, &BStr)> {
@@ -1140,7 +1362,7 @@ impl Store {
     }
 }
 
-static BUNDLE_BLOBS: Mutex<Vec<object_id>> = Mutex::new(Vec::new());
+static BUNDLE_BLOBS: Mutex<Vec<BlobId>> = Mutex::new(Vec::new());
 
 fn store_changesets_metadata(store: &Store) -> CommitId {
     let mut tree = Vec::new();
@@ -1152,7 +1374,6 @@ fn store_changesets_metadata(store: &Store) -> CommitId {
         .map(|(n, blob)| ((n + 1).to_string(), blob))
         .sorted_by(|(n, _), (n2, _)| Ord::cmp(n, n2))
     {
-        let blob = BlobId::from_unchecked(GitObjectId::from(blob));
         tree.extend_from_slice(b"100644 bundle");
         if n != "1" {
             tree.extend_from_slice(n.as_bytes());
@@ -1160,12 +1381,9 @@ fn store_changesets_metadata(store: &Store) -> CommitId {
         tree.extend_from_slice(b"\0");
         tree.extend_from_slice(blob.as_raw_bytes());
     }
-    let mut tid = object_id::default();
-    unsafe {
-        store_git_tree(tree.as_str_slice(), std::ptr::null(), &mut tid);
-    }
+    let tid = store_git_tree(&tree, None);
     let mut commit = Vec::new();
-    writeln!(commit, "tree {}", GitObjectId::from(tid)).ok();
+    writeln!(commit, "tree {}", tid).ok();
     let heads = store.changeset_heads();
     for (head, _) in heads.branch_heads() {
         writeln!(commit, "parent {}", head.to_git(store).unwrap()).ok();
@@ -1175,11 +1393,7 @@ fn store_changesets_metadata(store: &Store) -> CommitId {
     for (head, branch) in heads.branch_heads() {
         write!(commit, "\n{} {}", head, branch).ok();
     }
-    let mut result = object_id::default();
-    unsafe {
-        store_git_commit(commit.as_str_slice(), &mut result);
-    }
-    CommitId::from_unchecked(result.into())
+    store_git_commit(&commit)
 }
 
 fn store_manifests_metadata(store: &Store) -> CommitId {
@@ -1191,11 +1405,7 @@ fn store_manifests_metadata(store: &Store) -> CommitId {
     }
     writeln!(commit, "author  <cinnabar@git> 0 +0000").ok();
     writeln!(commit, "committer  <cinnabar@git> 0 +0000\n").ok();
-    let mut result = object_id::default();
-    unsafe {
-        store_git_commit(commit.as_str_slice(), &mut result);
-    }
-    CommitId::from_unchecked(result.into())
+    store_git_commit(&commit)
 }
 
 #[no_mangle]
@@ -1218,9 +1428,6 @@ pub fn set_changeset_heads(store: &Store, new_heads: ChangesetHeads) {
 
 extern "C" {
     pub fn ensure_store_init();
-    pub fn store_git_blob(blob_buf: strslice, result: *mut object_id);
-    fn store_git_tree(tree_buf: strslice, reference: *const object_id, result: *mut object_id);
-    pub fn store_git_commit(commit_buf: strslice, result: *mut object_id);
     fn store_git_object(
         typ: object_type,
         buf: strslice,
@@ -1230,6 +1437,61 @@ extern "C" {
     );
     pub fn do_set_replace(replaced: *const object_id, replace_with: *const object_id);
     fn get_object_entry(oid: *const object_id) -> *const object_entry;
+    fn unpack_object_entry(oe: *const object_entry, buf: *mut *mut c_char, len: *mut c_ulong);
+}
+
+pub fn store_git_blob(blob_buf: &[u8]) -> BlobId {
+    unsafe {
+        let mut result = object_id::default();
+        store_git_object(
+            object_type::OBJ_BLOB,
+            blob_buf.as_str_slice(),
+            &mut result,
+            ptr::null(),
+            ptr::null(),
+        );
+        BlobId::from_unchecked(result.into())
+    }
+}
+
+pub fn store_git_tree(tree_buf: &[u8], reference: Option<TreeId>) -> TreeId {
+    unsafe {
+        let mut oe = ptr::null();
+        let mut ref_tree = None;
+        if let Some(reference) = reference {
+            oe = get_object_entry(&reference.into());
+            if !oe.is_null() {
+                let mut reftree_buf = ptr::null_mut();
+                let mut len = 0;
+                unpack_object_entry(oe, &mut reftree_buf, &mut len);
+                ref_tree = Some(FfiBox::from_raw_parts(reftree_buf as *mut u8, len as usize));
+            }
+        }
+        let mut result = object_id::default();
+        let ref_tree = ref_tree.as_ref().map(|x| x.as_str_slice());
+        store_git_object(
+            object_type::OBJ_TREE,
+            tree_buf.as_str_slice(),
+            &mut result,
+            ref_tree.as_ref().map_or(ptr::null(), |x| x as *const _),
+            oe,
+        );
+        TreeId::from_unchecked(result.into())
+    }
+}
+
+pub fn store_git_commit(commit_buf: &[u8]) -> CommitId {
+    unsafe {
+        let mut result = object_id::default();
+        store_git_object(
+            object_type::OBJ_COMMIT,
+            commit_buf.as_str_slice(),
+            &mut result,
+            ptr::null(),
+            ptr::null(),
+        );
+        CommitId::from_unchecked(result.into())
+    }
 }
 
 pub enum SetWhat {
@@ -1260,7 +1522,6 @@ impl Store {
                 if git_id.is_null() {
                     self.hg2git_mut().remove_note(hg_id);
                 } else if let Ok(ref mut commit) = CommitId::try_from(git_id) {
-                    handle_changeset_conflict(self, HgChangesetId::from_unchecked(hg_id), commit);
                     self.hg2git_mut().add_note(hg_id, (*commit).into());
                 } else {
                     die!("Invalid object");
@@ -1392,15 +1653,11 @@ fn create_git_tree(
             }
             Either::Right(entry) => {
                 let oid = if entry.fid == RawHgFile::EMPTY_OID {
-                    let mut empty_blob_id = object_id::default();
-                    unsafe {
-                        store_git_blob([].as_str_slice(), &mut empty_blob_id);
-                    }
-                    let empty_blob_id = BlobId::from_unchecked(empty_blob_id.into());
+                    let empty_blob_id = store_git_blob(&[]);
                     assert_eq!(empty_blob_id, RawBlob::EMPTY_OID);
                     RawBlob::EMPTY_OID
-                } else if let Some(bid) = store.hg2git_mut().get_note(entry.fid.into()) {
-                    BlobId::from_unchecked(bid)
+                } else if let Some(bid) = entry.fid.to_git(store) {
+                    BlobId::from(bid)
                 } else {
                     corrupted_metata();
                 };
@@ -1419,16 +1676,7 @@ fn create_git_tree(
         tree_buf.extend_from_slice(b"\0");
         tree_buf.extend_from_slice(oid.as_raw_bytes());
     }
-    let mut result = object_id::default();
-    let ref_tree = ref_tree_id.map(GitObjectId::from).map(object_id::from);
-    unsafe {
-        store_git_tree(
-            tree_buf.as_str_slice(),
-            ref_tree.as_ref().map_or(ptr::null(), |x| x as *const _),
-            &mut result,
-        );
-    }
-    let result = TreeId::from_unchecked(result.into());
+    let result = store_git_tree(&tree_buf, ref_tree_id);
     if merge_tree_id.is_none() {
         store
             .tree_cache_
@@ -1452,11 +1700,7 @@ fn store_changeset(
         .ok_or(GraftError::NoGraft)?;
     let changeset = raw_changeset.parse().unwrap();
     let manifest_tree_id = GitManifestTreeId::from_unchecked(match changeset.manifest() {
-        m if m.is_null() => unsafe {
-            let mut tid = object_id::default();
-            store_git_tree([].as_str_slice(), std::ptr::null(), &mut tid);
-            TreeId::from_unchecked(GitObjectId::from(tid))
-        },
+        m if m.is_null() => store_git_tree(&[], None),
         m => {
             let git_manifest_id = m.to_git(store).unwrap();
             let manifest_commit = RawCommit::read(git_manifest_id.into()).unwrap();
@@ -1487,13 +1731,8 @@ fn store_changeset(
                     (Some(commit_id), None, true)
                 } else {
                     let buf = metadata.serialize();
-                    let mut cs_metadata_oid = object_id::default();
-                    unsafe {
-                        store_git_blob(buf.as_str_slice(), &mut cs_metadata_oid);
-                    }
-                    let metadata_id = GitChangesetMetadataId::from_unchecked(
-                        BlobId::from_unchecked(GitObjectId::from(cs_metadata_oid)),
-                    );
+                    let cs_metadata_oid = store_git_blob(&buf);
+                    let metadata_id = GitChangesetMetadataId::from_unchecked(cs_metadata_oid);
                     (Some(commit_id), Some(metadata_id), false)
                 }
             }
@@ -1503,12 +1742,28 @@ fn store_changeset(
 
     let (commit_id, metadata_id, replace) = if commit_id.is_none() || transition {
         let replace = commit_id;
-        let result = raw_commit_for_changeset(&changeset, tree_id, &git_parents);
-        let mut result_oid = object_id::default();
-        unsafe {
-            store_git_commit(result.as_bytes().as_str_slice(), &mut result_oid);
-        }
-        let commit_id = CommitId::from_unchecked(GitObjectId::from(result_oid));
+        let mut raw_commit = Vec::from(raw_commit_for_changeset(&changeset, tree_id, &git_parents));
+        let commit_id = loop {
+            let commit_id = store_git_commit(&raw_commit);
+            // There are cases where two changesets would map to the same git
+            // commit because their differences are not in information stored in
+            // the git commit (different manifest node, but identical tree ;
+            // different branches ; etc.)
+            // In that case, add invisible characters to the commit message until
+            // we find a commit that doesn't map to another changeset.
+            match GitChangesetId::from_unchecked(commit_id).to_hg(store) {
+                Some(existing_hg_id) if existing_hg_id != changeset_id => {
+                    if has_compat(Compat::CHANGESET_CONFLICT_NUL) {
+                        raw_commit.push(b'\0');
+                    } else {
+                        raw_commit.push(b'\n');
+                    }
+                }
+                _ => {
+                    break commit_id;
+                }
+            }
+        };
 
         let metadata = GeneratedGitChangesetMetadata::generate(
             store,
@@ -1518,13 +1773,8 @@ fn store_changeset(
         )
         .unwrap();
         let buf = metadata.serialize();
-        let mut cs_metadata_oid = object_id::default();
-        unsafe {
-            store_git_blob(buf.as_str_slice(), &mut cs_metadata_oid);
-        }
-        let metadata_id = GitChangesetMetadataId::from_unchecked(BlobId::from_unchecked(
-            GitObjectId::from(cs_metadata_oid),
-        ));
+        let cs_metadata_oid = store_git_blob(&buf);
+        let metadata_id = GitChangesetMetadataId::from_unchecked(cs_metadata_oid);
 
         (commit_id, metadata_id, replace)
     } else {
@@ -1557,35 +1807,6 @@ fn store_changeset(
         .as_bstr();
     heads.add(changeset_id, parents, branch);
     Ok(result)
-}
-
-fn handle_changeset_conflict(store: &Store, hg_id: HgChangesetId, git_id: &mut CommitId) {
-    // There are cases where two changesets would map to the same git
-    // commit because their differences are not in information stored in
-    // the git commit (different manifest node, but identical tree ;
-    // different branches ; etc.)
-    // In that case, add invisible characters to the commit message until
-    // we find a commit that doesn't map to another changeset.
-
-    let mut commit_data = None;
-    while let Some(existing_hg_id) = GitChangesetId::from_unchecked(*git_id).to_hg(store) {
-        // We might just already have the changeset in store.
-        if existing_hg_id == hg_id {
-            break;
-        }
-
-        let commit_data = commit_data.get_or_insert_with(|| {
-            let mut buf = Vec::new();
-            buf.extend_from_slice(RawCommit::read(*git_id).unwrap().as_bytes());
-            buf
-        });
-        commit_data.extend_from_slice(b"\0");
-        let mut new_git_id = object_id::default();
-        unsafe {
-            store_git_commit(commit_data.as_str_slice(), &mut new_git_id);
-        }
-        *git_id = CommitId::from_unchecked(new_git_id.into());
-    }
 }
 
 pub fn raw_commit_for_changeset(
@@ -1652,9 +1873,17 @@ pub fn create_changeset(
             .extra()
             .and_then(|e| e.get(b"branch").map(ToBoxed::to_boxed))
     });
+    let mut extra = None;
     if let Some(branch) = &branch {
-        let mut extra = ChangesetExtra::new();
+        let extra = extra.get_or_insert_with(ChangesetExtra::new);
         extra.set(b"branch", branch);
+    }
+    let git_commit_extra = experiment(Experiments::GIT_COMMIT).then(|| commit_id.to_string());
+    if let Some(git_commit_extra) = &git_commit_extra {
+        let extra = extra.get_or_insert_with(ChangesetExtra::new);
+        extra.set(b"git_commit", git_commit_extra.as_bytes());
+    }
+    if let Some(extra) = extra {
         let mut buf = Vec::new();
         extra.dump_into(&mut buf);
         cs_metadata.extra = Some(buf.into_boxed_slice());
@@ -1680,20 +1909,17 @@ pub fn create_changeset(
     hash.update(&changeset.0);
     cs_metadata.changeset_id = hash.finalize();
     let buf = cs_metadata.serialize();
-    let mut blob_oid = object_id::default();
-    unsafe {
-        store_git_blob(buf.as_str_slice(), &mut blob_oid);
-        store.set(
-            SetWhat::Changeset,
-            cs_metadata.changeset_id.into(),
-            commit_id.into(),
-        );
-        store.set(
-            SetWhat::ChangesetMeta,
-            cs_metadata.changeset_id.into(),
-            blob_oid.clone().into(),
-        );
-    }
+    let blob_oid = store_git_blob(&buf);
+    store.set(
+        SetWhat::Changeset,
+        cs_metadata.changeset_id.into(),
+        commit_id.into(),
+    );
+    store.set(
+        SetWhat::ChangesetMeta,
+        cs_metadata.changeset_id.into(),
+        blob_oid.into(),
+    );
     let mut heads = store.changeset_heads_mut();
     let branch = branch.as_deref().unwrap_or(b"default").as_bstr();
     heads.add(cs_metadata.changeset_id, &parents, branch);
@@ -1940,18 +2166,14 @@ pub fn store_changegroup<R: Read>(store: &Store, input: R, version: u8) {
             if content.starts_with(b"\x01\n") {
                 let [file_metadata, file_content] =
                     content[2..].splitn_exact(&b"\x01\n"[..]).unwrap();
-                unsafe {
-                    let mut metadata_oid = object_id::default();
-                    store_git_blob(file_metadata.as_str_slice(), &mut metadata_oid);
-                    store
-                        .files_meta_mut()
-                        .add_note(node.into(), metadata_oid.into());
-                }
+                let metadata_oid = store_git_blob(file_metadata);
+                store
+                    .files_meta_mut()
+                    .add_note(node.into(), metadata_oid.into());
                 content = file_content;
             }
             unsafe {
-                let mut file_oid = object_id::default();
-                if let Some(reference_entry) = (!delta_node.is_null())
+                let file_oid = if let Some(reference_entry) = (!delta_node.is_null())
                     .then(|| {
                         delta_node.to_git(store).and_then(|delta_node| {
                             get_object_entry(&GitObjectId::from(delta_node).into()).as_ref()
@@ -1965,6 +2187,7 @@ pub fn store_changegroup<R: Read>(store: &Store, input: R, version: u8) {
                         .map(BlobId::from_unchecked)
                         .map_or(0, |b| RawBlob::read(b).unwrap().as_bytes().len() + 4);
 
+                    let mut file_oid = object_id::default();
                     store_git_object(
                         object_type::OBJ_BLOB,
                         content.as_str_slice(),
@@ -1972,8 +2195,9 @@ pub fn store_changegroup<R: Read>(store: &Store, input: R, version: u8) {
                         &reference_file[reference_offset..].as_str_slice(),
                         reference_entry,
                     );
+                    BlobId::from_unchecked(file_oid.into())
                 } else {
-                    store_git_blob(content.as_str_slice(), &mut file_oid);
+                    store_git_blob(content)
                 };
                 store.hg2git_mut().add_note(node.into(), file_oid.into());
             }
@@ -2037,10 +2261,7 @@ pub fn store_changegroup<R: Read>(store: &Store, input: R, version: u8) {
     drop(input);
     drop(bundle_writer);
     if !bundle.is_empty() {
-        let mut bundle_blob = object_id::default();
-        unsafe {
-            store_git_blob(bundle.as_str_slice(), &mut bundle_blob);
-        }
+        let bundle_blob = store_git_blob(&bundle);
         BUNDLE_BLOBS.lock().unwrap().push(bundle_blob);
     }
 }
@@ -2143,6 +2364,7 @@ pub fn merge_metadata(
     let mut bundle = if remote_refs.is_empty() && ["http", "https"].contains(&git_url.scheme()) {
         let mut req = HttpRequest::new(git_url.clone());
         req.follow_redirects(true);
+        req.set_log_target("raw-wire::cinnabarclone".to_string());
         // We let curl handle Content-Encoding: gzip via Accept-Encoding.
         let mut bundle = match req.execute() {
             Ok(bundle) => bundle,
@@ -2537,11 +2759,7 @@ pub fn do_store_metadata(store: &Store) -> CommitId {
           \n\
           files-meta unified-manifests-v2",
         );
-        let mut result = object_id::default();
-        unsafe {
-            store_git_commit(buf.as_str_slice(), &mut result);
-        }
-        CommitId::from_unchecked(result.into())
+        store_git_commit(&buf)
     })();
     if progress_enabled() {
         eprintln!();

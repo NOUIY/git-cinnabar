@@ -20,19 +20,16 @@ int maybe_handle_command(struct reader *helper_input, int helper_output,
 
 struct object_entry *get_object_entry(const struct object_id *oid);
 
+void unpack_object_entry(struct object_entry *oe, char **buf,
+                         unsigned long *len);
+
 void store_git_tree(struct strslice tree_buf,
                     const struct object_id *reference,
                     struct object_id *result);
 
-void store_git_commit(struct strslice commit_buf, struct object_id *result);
-
-void store_git_blob(struct strslice blob_buf, struct object_id *result);
-
 void store_git_object(enum object_type type, const struct strslice buf,
                       struct object_id *result, const struct strslice *reference,
                       const struct object_entry *reference_entry);
-
-const struct object_id *ensure_empty_blob(void);
 
 void do_cleanup(int rollback);
 

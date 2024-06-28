@@ -38,8 +38,10 @@ Requirements:
 
 - Git (any version should work ; cinnabarclone bundles require 1.4.4).
 - In order to build from source:
-  - Rust 1.70.0 or newer.
-  - GCC or clang.
+  - Rust 1.74.0 or newer.
+  - A C compiler (GCC or clang).
+  - make.
+  - CURL development headers and libraries (except on Windows). Please note that on MacOS they are included in the SDK.
 
 Setup:
 ------
@@ -63,7 +65,7 @@ Setup:
 - Run the following:
 
   ```
-  $ cargo install git-cinnabar
+  $ cargo install --locked git-cinnabar
   $ git cinnabar setup
   ```
 
@@ -271,13 +273,28 @@ The default protocol is https, and the port can be omitted.
 
 - `hg::tags:` becomes `hg://:tags`
 
+Compatibility:
+--------------
+
+As of version 0.7, some corner cases in Mercurial repositories will generate
+different git commits than with prior versions of git-cinnabar. This means
+a fresh clone might have different git SHA-1s than existing clones, but this
+doesn't impact the use of existing clones with newer versions of git-cinnabar.
+
+Most repositories should remain non-affected by the change.
+
+You can set the `cinnabar.compat` git configuration to `0.6` to keep the
+previous behavior.
+
+
 Experimental features:
 ----------------------
 
 Git-cinnabar has a set of experimental features that can be enabled
 independently. You can set the `cinnabar.experiments` git configuration to a
-comma-separated list of those features to enable the selected ones, or to
-`all` to enable them all. The available features are:
+comma-separated list of those features to enable the selected ones.
+
+The available features are:
 
 - **merge**
 

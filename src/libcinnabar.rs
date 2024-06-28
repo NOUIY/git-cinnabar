@@ -8,11 +8,10 @@ use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 
-use crate::git::{CommitId, GitObjectId, TreeId};
+use crate::git::{CommitId, GitObjectId, RawTree, TreeId};
 use crate::hg::HgObjectId;
 use crate::libgit::{
     child_process, combine_notes_ignore, free_notes, init_notes, notes_tree, object_id, FileMode,
-    RawTree,
 };
 use crate::oid::{Abbrev, ObjectId};
 use crate::store::{store_git_commit, Store};
@@ -233,7 +232,7 @@ pub fn store_metadata_notes(
     reference: CommitId,
     mode: FileMode,
 ) -> CommitId {
-    let mut result = object_id::default();
+    let mut result = CommitId::NULL;
     let mut tree = object_id::default();
     if notes.current.dirty() || notes.additions.dirty() {
         unsafe {
@@ -242,8 +241,8 @@ pub fn store_metadata_notes(
     }
     let mut tree = TreeId::from_unchecked(GitObjectId::from(tree));
     if tree.is_null() {
-        result = reference.into();
-        if GitObjectId::from(result.clone()).is_null() {
+        result = reference;
+        if result.is_null() {
             tree = RawTree::EMPTY_OID;
         }
     }
@@ -253,11 +252,9 @@ pub fn store_metadata_notes(
         buf.extend_from_slice(
             b"author  <cinnabar@git> 0 +0000\ncommitter  <cinnabar@git> 0 +0000\n\n",
         );
-        unsafe {
-            store_git_commit(buf.as_str_slice(), &mut result);
-        }
+        result = store_git_commit(&buf);
     }
-    CommitId::from_unchecked(result.into())
+    result
 }
 
 #[allow(non_camel_case_types)]

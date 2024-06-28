@@ -256,9 +256,6 @@ static void end_packfile(void)
 	real_end_packfile();
 }
 
-extern void handle_changeset_conflict(const struct hg_object_id *hg_id,
-                                      struct object_id *git_id);
-
 void do_set_replace(const struct object_id *replaced,
                     const struct object_id *replace_with)
 {
@@ -278,7 +275,8 @@ void do_set_replace(const struct object_id *replaced,
 }
 
 int write_object_file_flags(const void *buf, size_t len, enum object_type type,
-                            struct object_id *oid, unsigned flags)
+                            struct object_id *oid, struct object_id *compat_oid_in,
+                            unsigned flags)
 {
 	struct strslice data;
 	data.buf = (void *)buf;
@@ -555,33 +553,11 @@ void store_replace_map(struct object_id *result) {
 	strbuf_release(&buf);
 }
 
-void store_git_tree(struct strslice tree_buf, const struct object_id *reference,
-                    struct object_id *result)
+void unpack_object_entry(struct object_entry *oe, char **buf,
+                         unsigned long *len)
 {
-	struct object_entry *oe = NULL;
-	if (reference) {
-		oe = get_object_entry(reference);
-	}
-	if (oe) {
-		struct strslice ref_tree;
-		unsigned long len;
-		ref_tree.buf = gfi_unpack_entry(oe, &len);
-		ref_tree.len = len;
-		store_git_object(OBJ_TREE, tree_buf, result, &ref_tree, oe);
-		free((char*)ref_tree.buf);
-	} else {
-		store_git_object(OBJ_TREE, tree_buf, result, NULL, NULL);
-	}
-}
-
-void store_git_blob(struct strslice blob_buf, struct object_id *result)
-{
-	store_git_object(OBJ_BLOB, blob_buf, result, NULL, NULL);
-}
-
-void store_git_commit(struct strslice commit_buf, struct object_id *result)
-{
-	store_git_object(OBJ_COMMIT, commit_buf, result, NULL, NULL);
+	// Note: ownership is given out.
+	*buf = gfi_unpack_entry(oe, len);
 }
 
 void store_git_object(enum object_type type, const struct strslice buf,
@@ -601,20 +577,4 @@ void store_git_object(enum object_type type, const struct strslice buf,
 	}
 	ENSURE_INIT();
 	store_object(type, &data, reference ? &ref_object : NULL, result, 0);
-}
-
-const struct object_id empty_blob = { {
-	0xe6, 0x9d, 0xe2, 0x9b, 0xb2, 0xd1, 0xd6, 0x43, 0x4b, 0x8b,
-	0x29, 0xae, 0x77, 0x5a, 0xd8, 0xc2, 0xe4, 0x8c, 0x53, 0x91,
-}, GIT_HASH_SHA1 };
-
-const struct object_id *ensure_empty_blob(void) {
-	struct object_entry *oe = find_object((struct object_id *)&empty_blob);
-	if (!oe) {
-		struct object_id hash;
-		struct strbuf buf = STRBUF_INIT;
-		store_object(OBJ_BLOB, &buf, NULL, &hash, 0);
-		assert(oidcmp(&hash, &empty_blob) == 0);
-	}
-	return &empty_blob;
 }

@@ -84,6 +84,14 @@ int maybe_boundary(struct rev_info *revs, struct commit *commit) {
 	return 0;
 }
 
+const struct commit *commit_list_item(const struct commit_list *list) {
+	return list->item;
+}
+
+const struct commit_list *commit_list_next(const struct commit_list *list) {
+	return list->next;
+}
+
 struct diff_tree_file {
 	struct object_id *oid;
 	char *path;
@@ -211,34 +219,39 @@ static void init_git_config(void)
 	strbuf_release(&path);
 }
 
-static void cleanup_git_config(void)
+static void cleanup_git_config(int nongit)
 {
 	const char *value;
 	if (!git_config_get_value("cinnabar.fsck", &value)) {
 		// We used to set cinnabar.fsck globally, then locally.
 		// Remove both.
 		char *user_config, *xdg_config;
-		git_global_config(&user_config, &xdg_config);
+		git_global_config_paths(&user_config, &xdg_config);
 		if (user_config) {
 			if (access_or_warn(user_config, R_OK, 0) &&
 				xdg_config &&
 				!access_or_warn(xdg_config, R_OK, 0))
 			{
 				git_config_set_in_file_gently(
-					xdg_config, "cinnabar.fsck", NULL);
+					xdg_config, "cinnabar.fsck", NULL,
+					NULL);
 			} else {
 				git_config_set_in_file_gently(
-					user_config, "cinnabar.fsck", NULL);
+					user_config, "cinnabar.fsck", NULL,
+					NULL);
 			}
 		}
 		free(user_config);
 		free(xdg_config);
-		user_config = git_pathdup("config");
-		if (user_config) {
-			git_config_set_in_file_gently(
-				user_config, "cinnabar.fsck", NULL);
+		if (!nongit) {
+			user_config = git_pathdup("config");
+			if (user_config) {
+				git_config_set_in_file_gently(
+					user_config, "cinnabar.fsck", NULL,
+					NULL);
+			}
+			free(user_config);
 		}
-		free(user_config);
 	}
 }
 
@@ -374,13 +387,51 @@ int init_cinnabar(const char *argv0)
 	init_git_config();
 	setup_git_directory_gently(&nongit);
 	git_config(git_diff_basic_config, NULL);
-	cleanup_git_config();
+	cleanup_git_config(nongit);
 	save_commit_buffer = 0;
 	warn_on_object_refname_ambiguity = 0;
 
-	// We check GIT_DIR because git 2.44.0 doesn't create a new repo
-	// during git clone in a way that sets `nongit` properly.
-	return !nongit || (getenv("GIT_DIR") != NULL);
+	// In git 2.44, git clone doesn't create a repository that
+	// setup_git_directory_gently will recognize as a git directory.
+	// The first indicator that we might be in a git clone is that
+	// GIT_DIR is set.
+	if (getenv("GIT_DIR") != NULL) {
+		if (nongit) {
+			// If GIT_DIR is set and setup_git_directory_gently
+			// says we're not in a git directory, assume we're in
+			// that weird git 2.44 case.
+			struct strbuf err = STRBUF_INIT;
+			check_repository_format(NULL);
+			if (refs_init_db(get_main_ref_store(the_repository),
+			                 0, &err))
+				die("failed to set up refs db: %s", err.buf);
+			nongit = 0;
+		} else {
+			// To make things even gnarlier, git 2.45 hits a case
+			// where it will print an irrelevant hint because of the
+			// HEAD it created itself. Removing that HEAD works
+			// around the problem, so try to detect it.
+			// See http://public-inbox.org/git/20240503020432.2fxwuhjsvumy7i7z@glandium.org/
+			struct strbuf head = STRBUF_INIT;
+			struct strbuf buf = STRBUF_INIT;
+			git_path_buf(&head, "HEAD");
+			if (strbuf_read_file(&buf, head.buf, 0) > 0) {
+				const char invalid_head_s[] =
+					"ref: refs/heads/.invalid\n";
+				struct strbuf invalid_head = {
+					.buf = (char*)invalid_head_s,
+					.len = sizeof(invalid_head_s) - 1,
+					.alloc = 0
+				};
+				if (strbuf_cmp(&invalid_head, &buf) == 0) {
+					unlink(head.buf);
+				}
+			}
+			strbuf_release(&head);
+			strbuf_release(&buf);
+		}
+	}
+	return !nongit;
 }
 
 int common_exit(const char *file, int line, int code)

@@ -28,19 +28,19 @@ use zstd::stream::read::Decoder as ZstdDecoder;
 use zstd::stream::write::Encoder as ZstdEncoder;
 
 use crate::get_changes;
-use crate::git::CommitId;
+use crate::git::{CommitId, RawCommit};
 use crate::hg::{HgChangesetId, HgFileId, HgManifestId, HgObjectId};
 use crate::hg_connect::{encodecaps, HgConnection, HgConnectionBase, HgRepo};
 use crate::hg_data::find_file_parents;
 use crate::libcinnabar::{hg_object_id, strslice, AsStrSlice};
-use crate::libgit::{die, RawCommit};
+use crate::libgit::die;
 use crate::oid::ObjectId;
 use crate::progress::Progress;
 use crate::store::{
     ChangesetHeads, RawGitChangesetMetadata, RawHgChangeset, RawHgFile, RawHgManifest, Store,
 };
 use crate::tree_util::{Empty, WithPath};
-use crate::util::{FromBytes, ImmutBString, ReadExt, SliceExt, ToBoxed};
+use crate::util::{assert_ge, assert_lt, FromBytes, ImmutBString, ReadExt, SliceExt, ToBoxed};
 use crate::xdiff::textdiff;
 
 #[no_mangle]
@@ -66,7 +66,10 @@ pub unsafe extern "C" fn rev_diff_iter_next(
     let next = diff_iter.next();
     ptr::write(iterator, diff_iter.0.as_str_slice());
     if let Some(p) = next {
-        ptr::write(part, mem::transmute(p.0));
+        ptr::write(
+            part,
+            mem::transmute::<rev_diff_part<'_>, rev_diff_part<'_>>(p.0),
+        );
         1
     } else {
         0

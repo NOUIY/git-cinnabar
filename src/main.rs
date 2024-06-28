@@ -42,8 +42,6 @@
 #[macro_use]
 extern crate derivative;
 #[macro_use]
-extern crate all_asserts;
-#[macro_use]
 extern crate log;
 
 mod cinnabar;
@@ -68,13 +66,13 @@ pub(crate) mod hg_connect_stdio;
 pub(crate) mod hg_data;
 
 use std::borrow::{Borrow, Cow};
-use std::cell::Cell;
+use std::cell::{Cell, OnceCell};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::File;
 use std::hash::Hash;
-use std::io::{stderr, stdin, stdout, BufRead, BufWriter, IsTerminal, Write};
+use std::io::{stderr, stdin, stdout, BufRead, BufReader, BufWriter, IsTerminal, Write};
 use std::iter::repeat;
 use std::os::raw::{c_char, c_int};
 #[cfg(windows)]
@@ -83,6 +81,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::{self, from_utf8, FromStr};
 use std::sync::Mutex;
+#[cfg(feature = "version-check")]
+use std::time::Duration;
 use std::time::Instant;
 use std::{cmp, fmt};
 
@@ -91,29 +91,32 @@ use bstr::io::BufReadExt;
 use bstr::{BStr, ByteSlice};
 use byteorder::{BigEndian, WriteBytesExt};
 use cinnabar::{
-    GitChangesetId, GitFileId, GitFileMetadataId, GitManifestId, GitManifestTree, GitManifestTreeId,
+    GitChangesetId, GitFileMetadataId, GitManifestId, GitManifestTree, GitManifestTreeId,
 };
-use clap::{crate_version, ArgGroup, Parser};
+use clap::{crate_version, Parser};
 use cstr::cstr;
 use either::Either;
-use git::{BlobId, CommitId, GitObjectId, TreeIsh};
+use git::{BlobId, CommitId, GitObjectId, RawBlob, RawCommit, RawTree, TreeIsh};
 use git_version::git_version;
 use graft::{graft_finish, grafted, init_graft};
 use hg::{HgChangesetId, HgFileId, HgManifestId, ManifestEntry};
-use hg_bundle::{create_bundle, create_chunk_data, BundleSpec, RevChunkIter};
-use hg_connect::{get_bundle, get_clonebundle_url, get_connection, get_store_bundle, HgRepo};
+use hg_bundle::{create_bundle, create_chunk_data, read_rev_chunk, BundleSpec, RevChunkIter};
+use hg_connect::{
+    get_bundle, get_bundle_connection, get_clonebundle_url, get_connection, get_store_bundle,
+    HgConnection, HgConnectionBase, HgRepo,
+};
 use itertools::EitherOrBoth::{Both, Left, Right};
 use itertools::{EitherOrBoth, Itertools};
 use libgit::{
     commit, config_get_value, die, diff_tree_with_copies, for_each_ref_in, for_each_remote,
     get_oid_committish, get_unique_abbrev, lookup_commit, lookup_replace_commit, object_id,
     reachable_subset, remote, repository, resolve_ref, rev_list, rev_list_with_boundaries,
-    the_repository, DiffTreeItem, MaybeBoundary, RawBlob, RawCommit, RawTree, RefTransaction,
+    the_repository, DiffTreeItem, MaybeBoundary, RefTransaction,
 };
 use logging::{LoggingReader, LoggingWriter};
 use oid::{Abbrev, ObjectId};
 use once_cell::sync::Lazy;
-use percent_encoding::{percent_decode, percent_encode, AsciiSet, CONTROLS};
+use percent_encoding::percent_decode;
 use progress::Progress;
 use sha1::{Digest, Sha1};
 use store::{
@@ -123,6 +126,7 @@ use store::{
     RawHgFile, RawHgManifest, SetWhat, Store, BROKEN_REF, CHECKED_REF, METADATA_REF, NOTES_REF,
     REFS_PREFIX, REPLACE_REFS_PREFIX,
 };
+use tee::TeeReader;
 use tree_util::{diff_by_path, RecurseTree};
 use url::Url;
 use util::{CStrExt, IteratorExt, OsStrExt, SliceExt, Transpose};
@@ -133,7 +137,7 @@ use crate::hg_bundle::BundleReader;
 use crate::hg_connect::{decodecaps, find_common, UnbundleResponse};
 use crate::libcinnabar::AsStrSlice;
 use crate::progress::set_progress;
-use crate::store::{clear_manifest_heads, do_set_replace, set_changeset_heads, Dag, Traversal};
+use crate::store::{clear_manifest_heads, do_set_replace, set_changeset_heads, Dag};
 use crate::tree_util::{Empty, ParseTree, WithPath};
 use crate::util::{FromBytes, ToBoxed};
 
@@ -248,13 +252,7 @@ pub fn prepare_arg(arg: OsString) -> Vec<u16> {
 }
 
 fn do_one_hg2git(store: &Store, sha1: Abbrev<HgChangesetId>) -> String {
-    format!(
-        "{}",
-        store
-            .hg2git_mut()
-            .get_note_abbrev(sha1)
-            .unwrap_or(GitObjectId::NULL)
-    )
+    format!("{}", sha1.to_git(store).unwrap_or(GitChangesetId::NULL))
 }
 
 fn do_one_git2hg(store: &Store, committish: OsString) -> String {
@@ -316,26 +314,20 @@ where
 }
 
 fn do_data_changeset(store: &Store, rev: Abbrev<HgChangesetId>) -> Result<(), String> {
-    let commit_id = store
-        .hg2git_mut()
-        .get_note_abbrev(rev)
-        .ok_or_else(|| format!("Unknown changeset id: {}", rev))?;
     let changeset = RawHgChangeset::read(
         store,
-        GitChangesetId::from_unchecked(CommitId::from_unchecked(commit_id)),
+        rev.to_git(store)
+            .ok_or_else(|| format!("Unknown changeset id: {}", rev))?,
     )
     .unwrap();
     stdout().write_all(&changeset).map_err(|e| e.to_string())
 }
 
 fn do_data_manifest(store: &Store, rev: Abbrev<HgManifestId>) -> Result<(), String> {
-    let commit_id = store
-        .hg2git_mut()
-        .get_note_abbrev(rev)
-        .ok_or_else(|| format!("Unknown manifest id: {}", rev))?;
-    let manifest = RawHgManifest::read(GitManifestId::from_unchecked(CommitId::from_unchecked(
-        commit_id,
-    )))
+    let manifest = RawHgManifest::read(
+        rev.to_git(store)
+            .ok_or_else(|| format!("Unknown manifest id: {}", rev))?,
+    )
     .unwrap();
     stdout().write_all(&manifest).map_err(|e| e.to_string())
 }
@@ -497,44 +489,186 @@ extern "C" {
     fn git_path_fetch_head(repos: *mut repository) -> *const c_char;
 }
 
-fn do_fetch(store: &mut Store, remote: &OsStr, revs: &[OsString]) -> Result<(), String> {
-    set_progress(stdout().is_terminal());
+struct BundleSaverConnection(Box<dyn HgRepo>);
+
+impl HgConnectionBase for BundleSaverConnection {
+    fn get_url(&self) -> Option<&Url> {
+        self.0.get_url()
+    }
+
+    fn get_capability(&self, name: &[u8]) -> Option<&BStr> {
+        self.0.get_capability(name)
+    }
+
+    fn require_capability(&self, name: &[u8]) -> &BStr {
+        self.0.require_capability(name)
+    }
+
+    fn sample_size(&self) -> usize {
+        self.0.sample_size()
+    }
+}
+impl HgConnection for BundleSaverConnection {
+    fn getbundle<'a>(
+        &'a mut self,
+        heads: &[HgChangesetId],
+        common: &[HgChangesetId],
+        bundle2caps: Option<&str>,
+    ) -> Result<Box<dyn std::io::Read + 'a>, util::ImmutBString> {
+        let reader = self.0.getbundle(heads, common, bundle2caps)?;
+        let mut stdout = std::io::stdout();
+        let mut bundle = BundleReader::new(TeeReader::new(reader, &mut stdout)).unwrap();
+        while let Some(part) = bundle.next_part().unwrap() {
+            if &*part.part_type == "changegroup" {
+                let version = part
+                    .get_param("version")
+                    .map_or(1, |v| u8::from_str(v).unwrap());
+                let mut part = BufReader::new(part);
+                RevChunkIter::new(version, &mut part)
+                    .progress(|n| format!("Reading {n} changesets"))
+                    .for_each(drop);
+                RevChunkIter::new(version, &mut part)
+                    .progress(|n| format!("Reading {n} manifests"))
+                    .for_each(drop);
+                let files = Cell::new(0);
+                let mut progress = repeat(())
+                    .progress(|n| format!("Reading {n} revisions of {} files", files.get()));
+                while {
+                    let buf = read_rev_chunk(&mut part);
+                    !buf.is_empty()
+                } {
+                    files.set(files.get() + 1);
+                    RevChunkIter::new(version, &mut part)
+                        .zip(&mut progress)
+                        .for_each(drop);
+                }
+            } else if &*part.part_type == "stream2" {
+                return Err(b"Stream bundles are not supported."
+                    .to_vec()
+                    .into_boxed_slice());
+            }
+        }
+        drop(bundle);
+        stdout.flush().map_err(|e| e.to_string().into_boxed_str())?;
+        Ok(Box::new(&b"HG20\0\0\0\0\0\0\0\0"[..]))
+    }
+
+    fn unbundle(&mut self, _heads: Option<&[HgChangesetId]>, _input: File) -> UnbundleResponse {
+        unimplemented!()
+    }
+
+    fn pushkey(
+        &mut self,
+        _namespace: &str,
+        _key: &str,
+        _old: &str,
+        _new: &str,
+    ) -> util::ImmutBString {
+        unimplemented!();
+    }
+
+    fn lookup(&mut self, key: &str) -> util::ImmutBString {
+        self.0.lookup(key)
+    }
+
+    fn clonebundles(&mut self) -> util::ImmutBString {
+        unimplemented!();
+    }
+
+    fn cinnabarclone(&mut self) -> util::ImmutBString {
+        unimplemented!();
+    }
+}
+
+impl HgRepo for BundleSaverConnection {
+    fn branchmap(&mut self) -> util::ImmutBString {
+        self.0.branchmap()
+    }
+
+    fn heads(&mut self) -> util::ImmutBString {
+        self.0.heads()
+    }
+
+    fn bookmarks(&mut self) -> util::ImmutBString {
+        self.0.bookmarks()
+    }
+
+    fn phases(&mut self) -> util::ImmutBString {
+        self.0.phases()
+    }
+
+    fn known(&mut self, nodes: &[HgChangesetId]) -> Box<[bool]> {
+        self.0.known(nodes)
+    }
+}
+
+fn do_fetch(
+    store: &mut Store,
+    remote: &OsStr,
+    revs: &[OsString],
+    bundle: bool,
+) -> Result<(), String> {
+    set_progress(bundle || stdout().is_terminal());
     let url = remote::get(remote).get_url();
     let hg_url =
         hg_url(url).ok_or_else(|| format!("Invalid mercurial url: {}", url.to_string_lossy()))?;
     let mut conn = hg_connect::get_connection(&hg_url)
         .ok_or_else(|| format!("Failed to connect to {}", hg_url))?;
-    if conn.get_capability(b"lookup").is_none() {
-        return Err(
-            "Remote repository does not support the \"lookup\" command. \
-                 Cannot fetch."
-                .to_owned(),
-        );
+    if bundle {
+        conn = Box::new(BundleSaverConnection(conn));
     }
-    let mut full_revs = vec![];
+    let supports_lookup = OnceCell::new();
     let revs = revs
         .iter()
         .map(|rev| match rev.to_string_lossy() {
-            Cow::Borrowed(s) => Ok(s),
+            Cow::Borrowed(s) => match HgChangesetId::from_str(s) {
+                Ok(h) => Ok(Either::Left(h)),
+                Err(_)
+                    if *supports_lookup
+                        .get_or_init(|| conn.get_capability(b"lookup").is_some()) =>
+                {
+                    let result = conn.lookup(s);
+                    let [success, data] = result
+                        .trim_end_with(|b| b.is_ascii_whitespace())
+                        .splitn_exact(b' ')
+                        .expect("lookup command result is malformed");
+                    if success == b"0" {
+                        return Err(data.to_str_lossy().into_owned());
+                    }
+                    Ok(Either::Right(
+                        data.to_str()
+                            .ok()
+                            .and_then(|d| HgChangesetId::from_str(d).ok())
+                            .expect("lookup command result is malformed"),
+                    ))
+                }
+                Err(_) => Err(format!(
+                    "Remote repository does not support the \"lookup\" command. \
+                    Cannot fetch {}.",
+                    s
+                )),
+            },
             Cow::Owned(s) => Err(format!("Invalid character in revision: {}", s)),
         })
         .collect::<Result<Vec<_>, _>>()?;
-    for rev in revs {
-        let result = conn.lookup(rev);
-        let [success, data] = result
-            .trim_end_with(|b| b.is_ascii_whitespace())
-            .splitn_exact(b' ')
-            .expect("lookup command result is malformed");
-        if success == b"0" {
-            return Err(data.to_str_lossy().into_owned());
-        }
-        full_revs.push(
-            data.to_str()
-                .ok()
-                .and_then(|d| HgChangesetId::from_str(d).ok())
-                .expect("lookup command result is malformed"),
-        );
+    let unknown = revs
+        .iter()
+        .filter_map(|r| r.left())
+        .chunks(conn.sample_size())
+        .into_iter()
+        .find_map(|chunk| {
+            let chunk = chunk.collect_vec();
+            conn.known(&chunk)
+                .iter()
+                .zip(&chunk)
+                .filter(|(known, _)| !**known)
+                .map(|(_, h)| *h)
+                .next()
+        });
+    if let Some(unknown) = unknown {
+        return Err(format!("Unknown revision: {}", unknown));
     }
+    let full_revs = revs.iter().map(|r| r.either(|h| h, |h| h)).collect_vec();
 
     check_graft_refs();
 
@@ -545,33 +679,52 @@ fn do_fetch(store: &mut Store, remote: &OsStr, revs: &[OsString]) -> Result<(), 
         init_graft(store);
     }
 
-    get_bundle(store, &mut *conn, &full_revs, &HashSet::new(), remote)?;
-
-    do_done_and_check(store, &[])
-        .then_some(())
-        .ok_or_else(|| "Fatal error".to_string())?;
-
-    let url = url.to_string_lossy();
-    let mut fetch_head = Vec::new();
-    let width = full_revs
+    let unknown_full_revs = full_revs
         .iter()
-        .map(|rev| {
-            let git_rev = rev.to_git(store).unwrap();
-            writeln!(fetch_head, "{}\t\t'hg/revs/{}' of {}", git_rev, rev, url).unwrap();
-            get_unique_abbrev(git_rev).len()
-        })
-        .max()
-        .unwrap()
-        * 2
-        + 3;
-    let path = unsafe { CStr::from_ptr(git_path_fetch_head(the_repository)).to_osstr() };
-    File::create(path)
-        .and_then(|mut f| f.write(&fetch_head))
-        .map_err(|e| e.to_string())?;
+        .filter(|h| h.to_git(store).is_none())
+        .copied()
+        .collect_vec();
 
-    eprintln!("From {}", url);
-    for rev in full_revs {
-        eprintln!(" * {:width$} hg/revs/{} -> FETCH_HEAD", "branch", rev);
+    if !unknown_full_revs.is_empty() {
+        get_bundle(
+            store,
+            &mut *conn,
+            &unknown_full_revs,
+            None,
+            &HashSet::new(),
+            remote,
+        )?;
+
+        if !bundle {
+            do_done_and_check(store, &[])
+                .then_some(())
+                .ok_or_else(|| "Fatal error".to_string())?;
+        }
+    }
+
+    if !bundle {
+        let url = url.to_string_lossy();
+        let mut fetch_head = Vec::new();
+        let width = full_revs
+            .iter()
+            .map(|rev| {
+                let git_rev = rev.to_git(store).unwrap();
+                writeln!(fetch_head, "{}\t\t'hg/revs/{}' of {}", git_rev, rev, url).unwrap();
+                get_unique_abbrev(git_rev).len()
+            })
+            .max()
+            .unwrap()
+            * 2
+            + 3;
+        let path = unsafe { CStr::from_ptr(git_path_fetch_head(the_repository)).to_osstr() };
+        File::create(path)
+            .and_then(|mut f| f.write(&fetch_head))
+            .map_err(|e| e.to_string())?;
+
+        eprintln!("From {}", url);
+        for rev in full_revs {
+            eprintln!(" * {:width$} hg/revs/{} -> FETCH_HEAD", "branch", rev);
+        }
     }
     Ok(())
 }
@@ -969,13 +1122,16 @@ fn do_reclone(store: &mut Store, rebase: bool) -> Result<(), String> {
             .unique()
             .collect_vec();
 
-        import_bundle(
-            &mut store,
-            &mut *conn,
-            remote.name().and_then(|n| n.to_str()),
-            &info,
-            &unknown_wanted_heads,
-        )?;
+        if !unknown_wanted_heads.is_empty() {
+            get_bundle(
+                &mut store,
+                &mut *conn,
+                &unknown_wanted_heads,
+                Some(&info.topological_heads),
+                &info.branch_names,
+                remote.name().and_then(|n| n.to_str()),
+            )?;
+        }
 
         for (refname, peer_ref, csid, cid) in wanted_refs.into_iter().unique() {
             let old_cid = resolve_ref(OsStr::from_bytes(&peer_ref));
@@ -1028,7 +1184,7 @@ fn do_reclone(store: &mut Store, rebase: bool) -> Result<(), String> {
             let mut conn = get_connection(&url).unwrap();
 
             let knowns = unknowns
-                .chunks(hg_connect::SAMPLE_SIZE)
+                .chunks(conn.sample_size())
                 .map(|unknowns| {
                     conn.known(&unknowns.iter().map(|(_, csid)| *csid).collect_vec())
                         .into_vec()
@@ -1052,6 +1208,7 @@ fn do_reclone(store: &mut Store, rebase: bool) -> Result<(), String> {
                     &mut store,
                     &mut *conn,
                     &knowns.iter().map(|(_, csid)| *csid).collect_vec(),
+                    None,
                     &HashSet::new(),
                     Some(remote.name().unwrap().to_str().unwrap()),
                 )?;
@@ -1145,11 +1302,7 @@ fn do_reclone(store: &mut Store, rebase: bool) -> Result<(), String> {
                 buf.extend_from_slice(commit.committer());
                 buf.extend_from_slice(b"\n\n");
                 buf.extend_from_slice(commit.body());
-                let mut new_oid = object_id::default();
-                unsafe {
-                    store::store_git_commit(buf.as_str_slice(), &mut new_oid);
-                }
-                let new_cid = CommitId::from_unchecked(new_oid.into());
+                let new_cid = store::store_git_commit(&buf);
                 assert!(rewritten.insert(cid, Some(new_cid)).is_none());
             } else {
                 assert!(rewritten.insert(cid, None).is_none());
@@ -1601,6 +1754,7 @@ fn download_build(
         eprintln!("Installing update from {url}");
         let mut req = HttpRequest::new(Url::parse(url).map_err(|e| e.to_string())?);
         req.follow_redirects(true);
+        req.set_log_target("raw-wire::self-update".to_string());
         req.execute()
     };
 
@@ -1696,11 +1850,9 @@ fn do_setup() -> Result<(), String> {
 
 fn do_data_file(store: &Store, rev: Abbrev<HgFileId>) -> Result<(), String> {
     let mut stdout = stdout();
-    let blob_id = store
-        .hg2git_mut()
-        .get_note_abbrev(rev)
+    let file_id = rev
+        .to_git(store)
         .ok_or_else(|| format!("Unknown file id: {}", rev))?;
-    let file_id = GitFileId::from_unchecked(BlobId::from_unchecked(blob_id));
     let metadata_id = store
         .files_meta_mut()
         .get_note_abbrev(rev)
@@ -1733,15 +1885,20 @@ fn do_unbundle(store: &mut Store, clonebundle: bool, mut url: OsString) -> Resul
     if graft_config_enabled(None)?.unwrap_or(false) {
         init_graft(store);
     }
-    if clonebundle {
+    let mut conn = if clonebundle {
         let mut conn = get_connection(&url).unwrap();
         if conn.get_capability(b"clonebundles").is_none() {
             Err("Repository does not support clonebundles")?;
         }
         url = get_clonebundle_url(&mut *conn).ok_or("Repository didn't provide a clonebundle")?;
+        // Release the connection now, so that its cleanup doesn't conflict
+        // with get_bundle_connection.  Yes, this API sucks.
+        std::mem::drop(conn);
         eprintln!("Getting clone bundle from {}", url);
-    }
-    let mut conn = get_connection(&url).unwrap();
+        get_bundle_connection(&url).unwrap()
+    } else {
+        get_connection(&url).unwrap()
+    };
 
     get_store_bundle(store, &mut *conn, &[], &[])
         .map_err(|e| String::from_utf8_lossy(&e).into_owned())?;
@@ -1829,12 +1986,9 @@ fn create_copy(
     hash.update(blob.as_bytes());
     let fid = hash.finalize();
 
-    let mut oid = object_id::default();
-    unsafe {
-        store_git_blob(metadata.as_str_slice(), &mut oid);
-        store.set(SetWhat::FileMeta, fid.into(), oid.into());
-        store.set(SetWhat::File, fid.into(), blobid.into());
-    }
+    let oid = store_git_blob(&metadata);
+    store.set(SetWhat::FileMeta, fid.into(), oid.into());
+    store.set(SetWhat::File, fid.into(), blobid.into());
     fid
 }
 
@@ -2129,11 +2283,11 @@ fn create_merge_changeset(
                 let dag = file_dags.entry(path).or_insert_with(Dag::new);
                 for &parent in &parents {
                     if dag.get(parent).is_none() {
-                        dag.add(parent, &[], (), |_, _| ());
+                        dag.add(parent, &[], ());
                     }
                 }
                 if dag.get(oid).is_none() {
-                    dag.add(oid, &parents, (), |_, _| ());
+                    dag.add(oid, &parents, ());
                 }
             }
         }
@@ -2191,16 +2345,10 @@ fn create_merge_changeset(
                         WARN.call_once(|| warn!(target: "root", "This may take a while..."));
                         let parents = file_dags
                             .remove(&path)
-                            .and_then(|mut dag| {
-                                let mut is_ancestor = |a: HgFileId, b| {
-                                    let mut result = false;
-                                    dag.traverse_mut(b, Traversal::Parents, |p, _| {
-                                        if p == a {
-                                            result = true;
-                                        }
-                                        !result
-                                    });
-                                    result
+                            .and_then(|dag| {
+                                let is_ancestor = |a: HgFileId, b| {
+                                    dag.traverse_parents(&[b], |_, _| true)
+                                        .any(|(&p, _)| p == a)
                                 };
                                 if is_ancestor(p1.fid, p2.fid) {
                                     Some(vec![p2.clone()])
@@ -2933,23 +3081,20 @@ fn do_fsck_full(
                 .unwrap();
         if fresh_metadata != metadata {
             fix(format!("Adjusted changeset metadata for {}", changeset_id));
-            unsafe {
-                store.set(SetWhat::Changeset, changeset_id.into(), GitObjectId::NULL);
-                store.set(SetWhat::Changeset, changeset_id.into(), cid.into());
-                let mut metadata_id = object_id::default();
-                let buf = fresh_metadata.serialize();
-                store_git_blob(buf.as_str_slice(), &mut metadata_id);
-                store.set(
-                    SetWhat::ChangesetMeta,
-                    changeset_id.into(),
-                    GitObjectId::NULL,
-                );
-                store.set(
-                    SetWhat::ChangesetMeta,
-                    changeset_id.into(),
-                    metadata_id.into(),
-                );
-            }
+            store.set(SetWhat::Changeset, changeset_id.into(), GitObjectId::NULL);
+            store.set(SetWhat::Changeset, changeset_id.into(), cid.into());
+            let buf = fresh_metadata.serialize();
+            let metadata_id = store_git_blob(&buf);
+            store.set(
+                SetWhat::ChangesetMeta,
+                changeset_id.into(),
+                GitObjectId::NULL,
+            );
+            store.set(
+                SetWhat::ChangesetMeta,
+                changeset_id.into(),
+                metadata_id.into(),
+            );
         }
 
         let manifest_id = changeset.manifest();
@@ -3297,183 +3442,160 @@ impl FromStr for AbbrevSize {
         let value = usize::from_str(s).map_err(|e| format!("{}", e))?;
         match value {
             3..=40 => Ok(AbbrevSize(value)),
-            41..=std::usize::MAX => Err(format!("value too large: {}", value)),
+            41..=usize::MAX => Err(format!("value too large: {}", value)),
             _ => Err(format!("value too small: {}", value)),
         }
     }
 }
 
 #[derive(Parser)]
-#[clap(name = "git-cinnabar")]
-#[clap(version=crate_version!())]
-#[clap(long_version=FULL_VERSION)]
-#[clap(arg_required_else_help = true)]
-#[clap(dont_collapse_args_in_usage = true)]
-#[clap(subcommand_required = true)]
+#[command(
+    name = "git-cinnabar",
+    version=crate_version!(),
+    long_version=FULL_VERSION,
+    arg_required_else_help = true,
+    dont_collapse_args_in_usage = true,
+    subcommand_required = true,
+)]
 enum CinnabarCommand {
-    #[clap(name = "remote-hg")]
-    #[clap(hide = true)]
+    #[command(name = "remote-hg", hide = true)]
     RemoteHg { remote: OsString, url: OsString },
-    #[clap(name = "data")]
-    #[clap(group = ArgGroup::new("input").multiple(false).required(true))]
-    #[clap(about = "Dump the contents of a mercurial revision")]
+    /// Dump the contents of a mercurial revision
+    #[command(name = "data")]
+    #[group(id = "input", multiple = false, required = true)]
     Data {
-        #[clap(short = 'c')]
-        #[clap(group = "input")]
-        #[clap(help = "Open changelog")]
+        /// Open changelog
+        #[arg(short = 'c', group = "input")]
         changeset: Option<Abbrev<HgChangesetId>>,
-        #[clap(short = 'm')]
-        #[clap(group = "input")]
-        #[clap(help = "Open manifest")]
+        /// Open manifest
+        #[arg(short = 'm', group = "input")]
         manifest: Option<Abbrev<HgManifestId>>,
-        #[clap(group = "input")]
-        #[clap(help = "Open file")]
+        /// Open file
+        #[arg(group = "input")]
         file: Option<Abbrev<HgFileId>>,
     },
-    #[clap(name = "hg2git")]
-    #[clap(group = ArgGroup::new("input").multiple(true).required(true))]
-    #[clap(about = "Convert mercurial sha1 to corresponding git sha1")]
+    /// Convert mercurial sha1 to corresponding git sha1
+    #[command(name = "hg2git")]
+    #[group(id = "input", multiple = true, required = true)]
     Hg2Git {
-        #[clap(long)]
-        #[clap(require_equals = true)]
-        #[clap(num_args = ..=1)]
-        #[clap(help = "Show a partial prefix")]
+        /// Show a partial prefix
+        #[arg(long, require_equals = true, num_args = ..=1)]
         abbrev: Option<Vec<AbbrevSize>>,
-        #[clap(group = "input")]
-        #[clap(help = "Mercurial sha1")]
+        /// Mercurial sha1
+        #[arg(group = "input")]
         sha1: Vec<Abbrev<HgChangesetId>>,
-        #[clap(long)]
-        #[clap(group = "input")]
-        #[clap(help = "Read sha1s on stdin")]
+        /// Read sha1s on stdin
+        #[arg(long, group = "input")]
         batch: bool,
     },
-    #[clap(name = "git2hg")]
-    #[clap(group = ArgGroup::new("input").multiple(true).required(true))]
-    #[clap(about = "Convert git sha1 to corresponding mercurial sha1")]
+    /// Convert git sha1 to corresponding mercurial sha1
+    #[command(name = "git2hg")]
+    #[group(id = "input", multiple = true, required = true)]
     Git2Hg {
-        #[clap(long)]
-        #[clap(require_equals = true)]
-        #[clap(num_args = ..=1)]
-        #[clap(help = "Show a partial prefix")]
+        /// Show a partial prefix
+        #[arg(long, require_equals = true, num_args = ..=1)]
         abbrev: Option<Vec<AbbrevSize>>,
-        #[clap(group = "input")]
-        #[clap(help = "Git sha1/committish")]
-        #[clap(value_parser)]
+        /// Git sha1/committish
+        #[arg(group = "input", value_parser)]
         committish: Vec<OsString>,
-        #[clap(long)]
-        #[clap(group = "input")]
-        #[clap(help = "Read sha1/committish on stdin")]
+        /// Read sha1/committish on stdin
+        #[arg(long)]
+        #[arg(long, group = "input")]
         batch: bool,
     },
-    #[clap(name = "fetch")]
-    #[clap(about = "Fetch a changeset from a mercurial remote")]
+    /// Fetch a changeset from a mercurial remote
+    #[command(name = "fetch")]
     Fetch {
-        #[clap(required_unless_present = "tags")]
-        #[clap(help = "Mercurial remote name or url")]
-        #[clap(value_parser)]
+        /// Mercurial remote name or url
+        #[arg(required_unless_present = "tags", value_parser)]
         remote: Option<OsString>,
-        #[clap(required_unless_present = "tags")]
-        #[clap(help = "Mercurial changeset to fetch")]
-        #[clap(value_parser)]
+        /// Mercurial changeset to fetch
+        #[arg(required_unless_present = "tags", value_parser)]
         revs: Vec<OsString>,
-        #[clap(long)]
-        #[clap(exclusive = true)]
-        #[clap(help = "Fetch tags")]
+        /// Don't import, but send the bundle to stdout
+        #[arg(long)]
+        bundle: bool,
+        /// Fetch tags
+        #[arg(long, exclusive = true)]
         tags: bool,
     },
-    #[clap(name = "reclone")]
-    #[clap(about = "Reclone all mercurial remotes")]
+    /// Reclone all mercurial remotes
+    #[command(name = "reclone")]
     Reclone {
-        #[clap(long)]
-        #[clap(help = "Rebase local branches")]
+        /// Rebase local branches
+        #[arg(long)]
         rebase: bool,
     },
-    #[clap(name = "rollback")]
-    #[clap(about = "Rollback cinnabar metadata state")]
+    #[command(name = "rollback")]
+    /// Rollback cinnabar metadata state
     Rollback {
-        #[clap(long)]
-        #[clap(conflicts_with = "committish")]
-        #[clap(help = "Show a list of candidates for rollback")]
+        /// Show a list of candidates for rollback
+        #[arg(long, conflicts_with = "committish")]
         candidates: bool,
-        #[clap(long)]
-        #[clap(conflicts_with = "committish")]
-        #[clap(conflicts_with = "candidates")]
-        #[clap(help = "Rollback to the last successful fsck state")]
+        /// Rollback to the last successful fsck state
+        #[arg(long, conflicts_with = "committish", conflicts_with = "candidates")]
         fsck: bool,
-        #[clap(long)]
-        #[clap(conflicts_with = "candidates")]
-        #[clap(
-            help = "Force to use the given committish even if it is not in the current metadata's ancestry"
-        )]
+        /// Force to use the given committish even if it is not in the current metadata's ancestry
+        #[arg(long, conflicts_with = "candidates")]
         force: bool,
-        #[clap(help = "Git sha1/committish of the state to rollback to")]
-        #[clap(value_parser)]
+        /// Git sha1/committish of the state to rollback to
+        #[arg(value_parser)]
         committish: Option<OsString>,
     },
-    #[clap(name = "fsck")]
-    #[clap(about = "Check cinnabar metadata consistency")]
+    /// Check cinnabar metadata consistency
+    #[command(name = "fsck")]
     Fsck {
-        #[clap(long)]
-        #[clap(
-            help = "Force check, even when metadata was already checked. Also disables incremental fsck"
-        )]
+        /// Force check, even when metadata was already checked. Also disables incremental fsck
+        #[arg(long)]
         force: bool,
-        #[clap(long)]
-        #[clap(help = "Check more thoroughly")]
-        #[clap(conflicts_with = "commit")]
+        /// Check more thoroughly
+        #[arg(long, conflicts_with = "commit")]
         full: bool,
-        #[clap(help = "Specific commit or changeset to check")]
-        #[clap(value_parser)]
+        /// Specific commit or changeset to check
+        #[arg(value_parser)]
         commit: Vec<OsString>,
     },
-    #[clap(name = "bundle")]
-    #[clap(about = "Create a mercurial bundle")]
+    /// Create a mercurial bundle
+    #[command(name = "bundle")]
     Bundle {
-        #[clap(long)]
-        #[clap(default_value = "2")]
-        #[clap(value_parser = clap::value_parser!(u8).range(1..=2))]
-        #[clap(help = "Bundle version")]
+        /// Bundle version
+        #[arg(long, default_value = "2", value_parser = clap::value_parser!(u8).range(1..=2))]
         version: u8,
-        #[clap(long)]
-        #[clap(short)]
-        #[clap(help = "Type of bundle (bundlespec)")]
-        #[clap(conflicts_with = "version")]
+        /// Type of bundle (bundlespec)
+        #[arg(long, short, conflicts_with = "version")]
         r#type: Option<BundleSpec>,
-        #[clap(help = "Path of the bundle")]
-        #[clap(value_parser)]
+        /// Path of the bundle
+        #[arg(value_parser)]
         path: PathBuf,
-        #[clap(help = "Git revision range (see the Specifying Ranges section of gitrevisions(7))")]
-        #[clap(value_parser)]
+        /// Git revision range (see the Specifying Ranges section of gitrevisions(7))
+        #[arg(value_parser)]
         revs: Vec<OsString>,
     },
-    #[clap(name = "unbundle")]
-    #[clap(about = "Apply a mercurial bundle to the repository")]
+    /// Apply a mercurial bundle to the repository
+    #[command(name = "unbundle")]
     Unbundle {
-        #[clap(long)]
-        #[clap(help = "Get clone bundle from given repository")]
+        /// Get clone bundle from given repository
+        #[arg(long)]
         clonebundle: bool,
-        #[clap(help = "Url/Location of the bundle")]
+        /// Url/Location of the bundle
         url: OsString,
     },
-    #[clap(name = "upgrade")]
-    #[clap(about = "Upgrade cinnabar metadata")]
+    /// Upgrade cinnabar metadata
+    #[command(name = "upgrade")]
     Upgrade,
+    /// Update git-cinnabar
     #[cfg(feature = "self-update")]
-    #[clap(name = "self-update")]
-    #[clap(about = "Update git-cinnabar")]
+    #[command(name = "self-update")]
     SelfUpdate {
-        #[clap(long)]
-        #[clap(help = "Branch to get updates from")]
+        /// Branch to get updates from
+        #[arg(long)]
         branch: Option<String>,
-        #[clap(long)]
-        #[clap(help = "Exact commit to get a version from")]
-        #[clap(value_parser)]
-        #[clap(conflicts_with = "branch")]
+        /// Exact commit to get a version from
+        #[arg(long, value_parser, conflicts_with = "branch")]
         exact: Option<CommitId>,
     },
-    #[clap(name = "setup")]
-    #[clap(about = "Setup git-cinnabar")]
-    #[clap(hide = true)]
+    /// Setup git-cinnabar
+    #[command(name = "setup", hide = true)]
     Setup,
 }
 
@@ -3489,6 +3611,14 @@ fn git_cinnabar(args: Option<&[&OsStr]>) -> Result<c_int, String> {
         Ok(c) => c,
         Err(e) => {
             e.print().unwrap();
+            #[cfg(feature = "version-check")]
+            if e.kind() == clap::error::ErrorKind::DisplayVersion
+                && format!("{}", e.render()) != concat!("git-cinnabar ", crate_version!(), "\n")
+            {
+                if let Some(mut checker) = VersionChecker::force_now() {
+                    checker.wait(Duration::from_secs(1));
+                }
+            }
             return if e.use_stderr() { Ok(1) } else { Ok(0) };
         }
     };
@@ -3542,8 +3672,9 @@ fn git_cinnabar(args: Option<&[&OsStr]>) -> Result<c_int, String> {
         Fetch {
             remote: Some(remote),
             revs,
+            bundle,
             tags: false,
-        } => do_fetch(&mut store, &remote, &revs),
+        } => do_fetch(&mut store, &remote, &revs, bundle),
         Fetch { tags: true, .. } => do_fetch_tags(),
         Fetch { remote: None, .. } => unreachable!(),
         Reclone { rebase } => do_reclone(&mut store, rebase),
@@ -3671,7 +3802,7 @@ struct RemoteInfo {
     head_ref: Option<Box<BStr>>,
     refs: BTreeMap<Box<BStr>, (HgChangesetId, Option<GitChangesetId>)>,
     topological_heads: Vec<HgChangesetId>,
-    branch_names: Vec<Box<BStr>>,
+    branch_names: HashSet<Box<BStr>>,
     bookmarks: HashMap<Box<BStr>, HgChangesetId>,
     refs_style: RefsStyle,
 }
@@ -3690,13 +3821,6 @@ fn repo_list(
 
     let mut refs = BTreeMap::new();
 
-    // Valid characters in mercurial branch names are not necessarily valid
-    // in git ref names. This function replaces unsupported characters with a
-    // url-like escape such that the name can be reversed straightforwardly.
-    // TODO: Actually sanitize all the conflicting cases, see
-    // git-check-ref-format(1).
-    const BRANCH_QUOTE_SET: &AsciiSet = &CONTROLS.add(b'%').add(b' ');
-
     let apply_template = |template: &[&str], values: &[&BStr]| {
         let mut buf = Vec::new();
         let mut values = values.iter();
@@ -3704,11 +3828,7 @@ fn repo_list(
             if part.is_empty() {
                 buf.extend_from_slice(values.next().unwrap());
             } else {
-                buf.extend_from_slice(
-                    percent_encode(part.as_bytes(), BRANCH_QUOTE_SET)
-                        .to_string()
-                        .as_bytes(),
-                );
+                buf.extend_from_slice(part.as_bytes());
             }
         }
         buf.as_bstr().to_boxed()
@@ -3748,8 +3868,13 @@ fn repo_list(
     let mut default_tip = None;
     if refs_style.intersects(RefsStyle::HEADS | RefsStyle::TIPS) {
         if refs_style.contains(RefsStyle::HEADS | RefsStyle::TIPS) {
-            head_template = Some(&["refs/heads/branches/", "", "/", ""][..]);
-            tip_template = Some(&["refs/heads/branches/", "", "/tip"][..]);
+            if refs_style.contains(RefsStyle::BOOKMARKS) {
+                head_template = Some(&["refs/heads/branches/", "", "/", ""][..]);
+                tip_template = Some(&["refs/heads/branches/", "", "/tip"][..]);
+            } else {
+                head_template = Some(&["refs/heads/", "", "/", ""][..]);
+                tip_template = Some(&["refs/heads/", "", "/tip"][..]);
+            }
         } else if refs_style.contains(RefsStyle::HEADS | RefsStyle::BOOKMARKS) {
             head_template = Some(&["refs/heads/branches/", "", "/", ""]);
         } else if refs_style.contains(RefsStyle::HEADS) {
@@ -3944,7 +4069,14 @@ fn remote_helper_import(
         if graft_config_enabled(remote)?.unwrap_or(false) {
             init_graft(store);
         }
-        import_bundle(store, conn, remote, &info, &unknown_wanted_heads)?;
+        get_bundle(
+            store,
+            conn,
+            &unknown_wanted_heads,
+            Some(&info.topological_heads),
+            &info.branch_names,
+            remote,
+        )?;
     }
 
     do_done_and_check(store, &[])
@@ -4002,46 +4134,6 @@ fn remote_helper_import(
     Ok(())
 }
 
-fn import_bundle(
-    store: &mut Store,
-    conn: &mut dyn HgRepo,
-    remote: Option<&str>,
-    info: &RemoteInfo,
-    unknown_wanted_heads: &[HgChangesetId],
-) -> Result<(), String> {
-    // TODO: Mercurial can be an order of magnitude slower when
-    // creating a bundle when not giving topological heads, which
-    // some of the branch heads might not be.
-    // http://bz.selenic.com/show_bug.cgi?id=4595
-    // The heads we've been asked for either come from the repo
-    // branchmap, and are a superset of its topological heads.
-    // That means if the heads we don't know in those we were asked for
-    // are a superset of the topological heads we don't know, then we
-    // should use those instead.
-    let mut unknown_wanted_heads = Cow::Borrowed(unknown_wanted_heads);
-    if !info.branch_names.is_empty() {
-        let unknown_topological_heads = info
-            .topological_heads
-            .iter()
-            .copied()
-            .filter(|h| h.to_git(store).is_none())
-            .collect::<Vec<_>>();
-        if unknown_wanted_heads
-            .iter()
-            .collect::<HashSet<_>>()
-            .is_superset(&unknown_topological_heads.iter().collect())
-        {
-            unknown_wanted_heads = Cow::Owned(unknown_topological_heads);
-        }
-    }
-    let branch_names = info
-        .branch_names
-        .iter()
-        .map(|b| &**b)
-        .collect::<HashSet<_>>();
-    get_bundle(store, conn, &unknown_wanted_heads, &branch_names, remote)
-}
-
 fn check_graft_refs() {
     if get_config("graft-refs").is_some() {
         warn!(
@@ -4069,7 +4161,6 @@ fn remote_helper_push(
                 .strip_prefix(b"+")
                 .map_or((source, false), |s| (s, true));
             (
-                source.as_bstr(),
                 (!source.is_empty()).then(|| get_oid_committish(source).unwrap()),
                 dest.as_bstr(),
                 force,
@@ -4079,7 +4170,7 @@ fn remote_helper_push(
 
     let broken = resolve_ref(METADATA_REF).map(|m| resolve_ref(BROKEN_REF) == Some(m));
     if broken == Some(true) || conn.get_capability(b"unbundle").is_none() {
-        for (_, _, dest, _) in &push_refs {
+        for (_, dest, _) in &push_refs {
             let mut buf = b"error ".to_vec();
             buf.extend_from_slice(dest);
             buf.extend_from_slice(if broken == Some(true) {
@@ -4092,13 +4183,6 @@ fn remote_helper_push(
         stdout.write_all(b"\n").unwrap();
         stdout.flush().unwrap();
         return Ok(0);
-    }
-    if let Some(metadata) = resolve_ref(METADATA_REF) {
-        if Some(metadata) == resolve_ref(BROKEN_REF) {
-            return Err(
-                "Cannot fetch with broken metadata. Please fix your clone first.".to_string(),
-            );
-        }
     }
 
     let bookmark_prefix = info.refs_style.contains(RefsStyle::BOOKMARKS).then(|| {
@@ -4114,23 +4198,22 @@ fn remote_helper_push(
 
     let mut pushed = ChangesetHeads::new();
     let result = (|| {
-        let branch_names = info.branch_names.into_iter().collect::<HashSet<_>>();
-        let push_commits = push_refs.iter().filter_map(|(_, c, _, _)| *c).collect_vec();
+        let push_commits = push_refs.iter().filter_map(|(c, _, _)| *c).collect_vec();
         let local_bases = rev_list_with_boundaries(
             store
                 .changeset_heads()
                 .branch_heads()
-                .filter(|(_, b)| branch_names.contains(*b))
+                .filter(|(_, b)| info.branch_names.contains(*b))
                 .map(|(h, _)| format!("^{}", h.to_git(store).unwrap()))
                 .chain(push_commits.iter().map(ToString::to_string))
                 .chain(["--topo-order".to_string(), "--full-history".to_string()]),
         )
-        .filter_map(|b| match b {
-            MaybeBoundary::Boundary(c) => Some(Ok(c)),
+        .filter_map(|(c, b)| match b {
+            MaybeBoundary::Boundary => Some(Ok(c)),
             MaybeBoundary::Shallow => Some(Err(
                 "Pushing git shallow clones is not supported.".to_string()
             )),
-            MaybeBoundary::Commit(_) => None,
+            MaybeBoundary::Commit => None,
         })
         .chain(push_commits.into_iter().map(Ok))
         .map_ok(GitChangesetId::from_unchecked)
@@ -4138,8 +4221,8 @@ fn remote_helper_push(
         .unique()
         .collect::<Result<Vec<_>, _>>()?;
 
-        let pushing_anything = push_refs.iter().any(|(_, c, _, _)| c.is_some());
-        let force = push_refs.iter().all(|(_, _, _, force)| *force);
+        let pushing_anything = push_refs.iter().any(|(c, _, _)| c.is_some());
+        let force = push_refs.iter().all(|(_, _, force)| *force);
         let no_topological_heads = info.topological_heads.iter().all(ObjectId::is_null);
         if pushing_anything && local_bases.is_empty() && !no_topological_heads {
             let mut fail = true;
@@ -4161,7 +4244,7 @@ fn remote_helper_push(
             }
         }
 
-        let common = find_common(store, conn, local_bases);
+        let common = find_common(store, conn, local_bases, remote);
 
         let push_commits = rev_list(
             ["--topo-order", "--full-history", "--reverse"]
@@ -4175,7 +4258,7 @@ fn remote_helper_push(
                 .chain(
                     push_refs
                         .iter()
-                        .filter_map(|(_, c, _, _)| c.as_ref().map(ToString::to_string)),
+                        .filter_map(|(c, _, _)| c.as_ref().map(ToString::to_string)),
                 ),
         )
         .map(|c| {
@@ -4291,7 +4374,7 @@ fn remote_helper_push(
         .then(|| &push_refs[..])
         .into_iter()
         .flatten()
-        .map(|(_, source_cid, dest, _)| {
+        .map(|(source_cid, dest, _)| {
             let status = if dest.starts_with(b"refs/tags/") {
                 Err(if source_cid.is_some() {
                     "Pushing tags is unsupported"
@@ -4329,7 +4412,7 @@ fn remote_helper_push(
         .collect::<HashMap<_, _>>();
 
     if !status.is_empty() {
-        for (_, _, dest, _) in push_refs {
+        for (_, dest, _) in push_refs {
             let mut buf = Vec::new();
             match status[dest] {
                 Ok(true) => {
@@ -4753,23 +4836,57 @@ pub fn check_enabled(checks: Checks) -> bool {
     CHECKS.contains(checks)
 }
 
-pub struct Experiments {
-    merge: bool,
+bitflags! {
+    #[derive(Debug)]
+    pub struct Compat: i32 {
+        const CHANGESET_CONFLICT_NUL = 0x1;
+
+        const CINNABAR_0_6 = Compat::CHANGESET_CONFLICT_NUL.bits();
+    }
+}
+
+static COMPAT: Lazy<Compat> =
+    Lazy::new(
+        || match get_config("compat").as_ref().map(|x| x.as_bytes()) {
+            Some(b"0.6") => Compat::CINNABAR_0_6,
+            Some(x) => {
+                warn!(target: "root", "Ignoring invalid value for compat: {}", x.as_bstr());
+                Compat::empty()
+            }
+            None => Compat::empty(),
+        },
+    );
+
+pub fn has_compat(c: Compat) -> bool {
+    COMPAT.contains(c)
+}
+
+bitflags! {
+    pub struct Experiments: i32 {
+        const MERGE = 0x1;
+        // Add git commit as extra metadata in mercurial changesets.
+        const GIT_COMMIT = 0x2;
+    }
+}
+pub struct AllExperiments {
+    flags: Experiments,
     similarity: CString,
 }
 
-impl Experiments {
-    const MERGE: u8 = 0x1;
-}
-
-static EXPERIMENTS: Lazy<Experiments> = Lazy::new(|| {
-    let mut merge = false;
+static EXPERIMENTS: Lazy<AllExperiments> = Lazy::new(|| {
+    let mut flags = Experiments::empty();
     let mut similarity = None;
     if let Some(config) = get_config("experiments") {
         for c in config.as_bytes().split(|&b| b == b',') {
             match c {
-                b"true" | b"all" | b"merge" => {
-                    merge = true;
+                b"true" | b"all" => {
+                    warn!(target: "root", "`cinnabar.experiments` value `{}` is not supported anymore. Please enable experiments individually.", c.as_bstr());
+                }
+                b"merge" => {
+                    flags |= Experiments::MERGE;
+                }
+                b"git_commit" => {
+                    flags |= Experiments::GIT_COMMIT;
                 }
                 s if s.starts_with(b"similarity") => {
                     if let Some(value) = s[b"similarity".len()..].strip_prefix(b"=") {
@@ -4789,17 +4906,14 @@ static EXPERIMENTS: Lazy<Experiments> = Lazy::new(|| {
             }
         }
     }
-    Experiments {
-        merge,
+    AllExperiments {
+        flags,
         similarity: similarity.unwrap_or_else(|| cstr!("-C100%").into()),
     }
 });
 
-pub fn experiment(experiments: u8) -> bool {
-    match experiments {
-        Experiments::MERGE => EXPERIMENTS.merge,
-        _ => false,
-    }
+pub fn experiment(experiments: Experiments) -> bool {
+    EXPERIMENTS.flags.contains(experiments)
 }
 
 pub fn experiment_similarity() -> &'static CStr {
