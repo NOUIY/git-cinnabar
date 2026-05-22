@@ -259,3 +259,20 @@ produced, by removing newlines from the end of commit messages.
         c
         d
     
+
+Create metadata for a fresh commit on the git side.
+
+  $ create_git i
+  $ git -c cinnabar.data=force push --dry-run hg::$HGREPO main:branches/default/tip
+  To hg::.*/grafts.t/hgrepo (re)
+     b1241ac..60acdeb  main -> branches/default/tip
+
+Pushing that after metadata was created should not fail.
+
+  $ git -c cinnabar.data=force push hg::$HGREPO main:branches/default/tip
+  remote: adding changesets
+  remote: adding manifests
+  remote: adding file changes
+  remote: added 1 changesets with 1 changes to 1 files
+  To hg::.*/grafts.t/hgrepo (re)
+     b1241ac..60acdeb  main -> branches/default/tip

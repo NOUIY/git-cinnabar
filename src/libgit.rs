@@ -530,7 +530,9 @@ impl Iterator for RevList {
         let start = self.duration.is_some().then(Instant::now);
         let result = unsafe {
             get_revision(self.revs).as_ref().map(|c| {
-                CommitId::from_unchecked(GitObjectId::from(commit_oid(c).as_ref().unwrap().clone()))
+                lookup_replace_commit(CommitId::from_unchecked(GitObjectId::from(
+                    commit_oid(c).as_ref().unwrap().clone(),
+                )))
             })
         };
         if let Some(((_, duration), start)) = self.duration.as_mut().zip(start) {
@@ -566,9 +568,9 @@ impl Iterator for RevListWithBoundaries {
         let start = self.0.duration.is_some().then(Instant::now);
         let result = unsafe {
             get_revision(self.0.revs).as_ref().map(|c| {
-                let cid = CommitId::from_unchecked(GitObjectId::from(
+                let cid = lookup_replace_commit(CommitId::from_unchecked(GitObjectId::from(
                     commit_oid(c).as_ref().unwrap().clone(),
-                ));
+                )));
                 let maybe_boundary = match maybe_boundary(self.0.revs, c) {
                     0 => MaybeBoundary::Commit,
                     1 => MaybeBoundary::Boundary,
@@ -610,18 +612,20 @@ impl Iterator for RevListWithParents {
                     if parents_commit_list.is_null() {
                         break;
                     }
-                    parents.push(CommitId::from_unchecked(GitObjectId::from(
-                        commit_oid(commit_list_item(parents_commit_list))
-                            .as_ref()
-                            .unwrap()
-                            .clone(),
+                    parents.push(lookup_replace_commit(CommitId::from_unchecked(
+                        GitObjectId::from(
+                            commit_oid(commit_list_item(parents_commit_list))
+                                .as_ref()
+                                .unwrap()
+                                .clone(),
+                        ),
                     )));
                     parents_commit_list = commit_list_next(parents_commit_list);
                 }
                 (
-                    CommitId::from_unchecked(GitObjectId::from(
+                    lookup_replace_commit(CommitId::from_unchecked(GitObjectId::from(
                         commit_oid(c).as_ref().unwrap().clone(),
-                    )),
+                    ))),
                     parents.into(),
                 )
             })
