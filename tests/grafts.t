@@ -174,4 +174,88 @@ Rewind to have the same timestamp
         c
         d
     
+Try again with what looks more like what git-cinnabar itself would have
+produced, by removing newlines from the end of commit messages.
 
+  $ git cinnabar clear
+  $ git filter-branch --msg-filter "awk 'NR > 1 { printf \"\\n\" } { printf \"%s\", \$0 }'" >/dev/null 2>&1
+
+  $ git log --oneline --graph
+  *   b1241ac merge2
+  |\  
+  | * a47b1bf h
+  * | 44e4e8b h-
+  |/  
+  *   30a8507 merge
+  |\  
+  | * 686539f f
+  * | aa9c8bb g
+  |/  
+  * 2c8e128 e
+  * f0a1cba d
+  * 687e015 c
+  * d04f6df b
+  * 8b86a58 a
+
+  $ git -c cinnabar.graft=true fetch -q hg::$HGREPO
+  $ git log --oneline --graph --notes=cinnabar
+  *   b1241ac merge2
+  |\  Notes (cinnabar):
+  | |     changeset b251f5b61a34a71c5736e9a746fbe18e830e7692
+  | |     manifest 164b2f0736d9b0ecd5d3a9cd07c23dc37cf0a875
+  | | 
+  | * a47b1bf h
+  | | Notes (cinnabar):
+  | |     changeset 00f515a92d5b35c58f66352a846699f1f9d38939
+  | |     manifest 164b2f0736d9b0ecd5d3a9cd07c23dc37cf0a875
+  | |     files h
+  | | 
+  * | 44e4e8b h-
+  |/  Notes (cinnabar):
+  |       changeset 68695712246fb6549a41db72c70ba76709742dfc
+  |       manifest 164b2f0736d9b0ecd5d3a9cd07c23dc37cf0a875
+  |       extra branch:foo
+  |       files h
+  |       patch 67,68,
+  |   
+  *   30a8507 merge
+  |\  Notes (cinnabar):
+  | |     changeset bc15c20fd6a3a1fdd70f67f278b4374c6d5e3ed2
+  | |     manifest cd78cfd51d7278235f744c257dd402f6a118bc9b
+  | | 
+  | * 686539f f
+  | | Notes (cinnabar):
+  | |     changeset aa7250354ccc66f3c4b8d068fc00e5c1b0d8a838
+  | |     manifest 488092b4bec54565c630cdf953d5945e1a4993a0
+  | |     files f
+  | | 
+  * | aa9c8bb g
+  |/  Notes (cinnabar):
+  |       changeset 299c5a9b90df6fdd0dc2b3716a114545a6536394
+  |       manifest 3fb79d9a3901d9812a56e2fdfe3049d0b6c2f83a
+  |       files g
+  |   
+  * 2c8e128 e
+  | Notes (cinnabar):
+  |     changeset 695eafa9c5b95e82f2ebc39f9fb63fd2470862e8
+  |     manifest 251ee6379d69fc281a21ff9890c4d4cb46c30336
+  |     files e
+  | 
+  * f0a1cba d
+  * 687e015 c
+  * d04f6df b
+  * 8b86a58 a
+
+
+  $ git for-each-ref refs/cinnabar/replace
+  c580451755f958f4ee1468e21633521d089710ac commit\trefs/cinnabar/replace/f0a1cba4d5a6919f6ba44b775278734fb5e30f78 (esc)
+  $ git log --oneline --graph --notes=cinnabar c580451755f958f4ee1468e21633521d089710ac
+  * c580451 d
+    Notes (cinnabar):
+        changeset 3d1f6f97e0be2f7faab7c8e2b3fe7dd139f492a2
+        manifest 9c601042bb6720fc7b4364539cae4716791e5fda
+        files a
+        b
+        c
+        d
+    

@@ -1726,14 +1726,18 @@ fn store_changeset(
     let (commit_id, metadata_id, transition) =
         match graft(store, changeset_id, raw_changeset, tree_id, parents) {
             Ok(Some(commit_id)) => {
+                let commit = RawCommit::read(commit_id).unwrap();
+                let commit = commit.parse().unwrap();
                 let metadata = GeneratedGitChangesetMetadata::generate(
                     store,
-                    &RawCommit::read(commit_id).unwrap().parse().unwrap(),
+                    &commit,
                     changeset_id,
                     raw_changeset,
                 )
                 .unwrap();
-                if !grafted() && metadata.patch().is_some() {
+                if !grafted()
+                    && (metadata.patch().is_some() || commit.parents().len() != parents.len())
+                {
                     (Some(commit_id), None, true)
                 } else {
                     let buf = metadata.serialize();
