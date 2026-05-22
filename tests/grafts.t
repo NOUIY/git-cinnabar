@@ -35,8 +35,29 @@ Create a mercurial repository.
   $ hg merge -q
   $ create_hg g merge 2>/dev/null
 
+Corner case: some repos may contain very similar commits as parents
+of a merge.
+
+  $ create_hg h
+  $ hg up -q -r 4
+  $ hg branch foo > /dev/null
+
+Rewind to have the same timestamp
+
+  $ n=$(expr $n - 1)
+  $ create_hg h
+  $ hg up -q -r default
+  $ hg merge -q -r foo
+  $ create_hg g merge2 2>/dev/null
+
   $ hg log -G --template '{node} {branch} {desc}'
-  @    bc15c20fd6a3a1fdd70f67f278b4374c6d5e3ed2 default merge
+  @    b251f5b61a34a71c5736e9a746fbe18e830e7692 default merge2
+  |\
+  | o  68695712246fb6549a41db72c70ba76709742dfc foo h
+  | |
+  o |  00f515a92d5b35c58f66352a846699f1f9d38939 default h
+  |/
+  o    bc15c20fd6a3a1fdd70f67f278b4374c6d5e3ed2 default merge
   |\
   | o  299c5a9b90df6fdd0dc2b3716a114545a6536394 default g
   | |
@@ -57,8 +78,24 @@ Create a mercurial repository.
   $ create_git g merge
   $ git checkout -q main
   $ git merge -q HEAD@{1}
+  $ create_git h
+  $ git checkout -q HEAD~
+
+Rewind to have the same timestamp
+
+  $ ng=$(expr $ng - 1)
+  $ create_git h "h-"
+  $ git merge -q main --no-commit 2>/dev/null
+  $ create_git h merge2
+  $ git checkout -q main
+  $ git merge -q HEAD@{1}
 
   $ git log --oneline --graph
+  *   9c2fa0d merge2
+  |\  
+  | * 62a25a3 h
+  * | b07c195 h-
+  |/  
   *   4b7ce9d merge
   |\  
   | * d06f423 f
@@ -72,6 +109,27 @@ Create a mercurial repository.
 
   $ git -c cinnabar.graft=true fetch -q hg::$HGREPO
   $ git log --oneline --graph --notes=cinnabar
+  *   9c2fa0d merge2
+  |\  Notes (cinnabar):
+  | |     changeset b251f5b61a34a71c5736e9a746fbe18e830e7692
+  | |     manifest 164b2f0736d9b0ecd5d3a9cd07c23dc37cf0a875
+  | |     patch 59,60,
+  | | 
+  | * 62a25a3 h
+  | | Notes (cinnabar):
+  | |     changeset 00f515a92d5b35c58f66352a846699f1f9d38939
+  | |     manifest 164b2f0736d9b0ecd5d3a9cd07c23dc37cf0a875
+  | |     files h
+  | |     patch 56,57,
+  | | 
+  * | b07c195 h-
+  |/  Notes (cinnabar):
+  |       changeset 68695712246fb6549a41db72c70ba76709742dfc
+  |       manifest 164b2f0736d9b0ecd5d3a9cd07c23dc37cf0a875
+  |       extra branch:foo
+  |       files h
+  |       patch 67,69,
+  |   
   *   4b7ce9d merge
   |\  Notes (cinnabar):
   | |     changeset bc15c20fd6a3a1fdd70f67f278b4374c6d5e3ed2

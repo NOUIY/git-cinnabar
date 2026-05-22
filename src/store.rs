@@ -1724,7 +1724,7 @@ fn store_changeset(
     let tree_id = create_git_tree(store, manifest_tree_id, ref_tree, None);
 
     let (commit_id, metadata_id, transition) =
-        match graft(store, changeset_id, raw_changeset, tree_id, &git_parents) {
+        match graft(store, changeset_id, raw_changeset, tree_id, parents) {
             Ok(Some(commit_id)) => {
                 let metadata = GeneratedGitChangesetMetadata::generate(
                     store,
