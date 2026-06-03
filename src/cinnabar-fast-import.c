@@ -47,9 +47,9 @@ static void rollback(void) {
 static struct pack_window *pack_win;
 static struct pack_window *prev_win;
 
-void real_hashwrite(struct hashfile *, const void *, unsigned int);
+void real_hashwrite(struct hashfile *, const void *, uint32_t);
 
-void hashwrite(struct hashfile *f, const void *buf, unsigned int count)
+void hashwrite(struct hashfile *f, const void *buf, uint32_t count)
 {
 	size_t window_size;
 	size_t packed_git_window_size =
@@ -208,7 +208,8 @@ void do_cleanup(int rollback)
 static void start_packfile(void)
 {
 	real_start_packfile();
-	packfile_store_add_pack(the_repository->objects->sources->packfiles, pack_data);
+	struct odb_source_files *files = odb_source_files_downcast(the_repository->objects->sources);
+	packfile_store_add_pack(files->packed, pack_data);
 }
 
 static void end_packfile(void)
@@ -236,7 +237,8 @@ static void end_packfile(void)
 
 	/* uninstall_packed_git(pack_data) */
 	if (pack_data) {
-		packfile_list_remove(&the_repository->objects->sources->packfiles->packs, pack_data);
+		struct odb_source_files *files = odb_source_files_downcast(the_repository->objects->sources);
+		packfile_list_remove(&files->packed->packs, pack_data);
 		close_pack_windows(pack_data);
 	}
 

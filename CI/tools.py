@@ -16,7 +16,7 @@ from tasks import (
 from util import build_commit
 
 MERCURIAL_VERSION = "7.2"
-GIT_VERSION = "2.53.0"
+GIT_VERSION = "2.54.0"
 
 ALL_MERCURIAL_VERSIONS = (
     "1.9.3",

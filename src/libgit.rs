@@ -16,6 +16,7 @@ use bstr::ByteSlice;
 use cstr::cstr;
 use curl_sys::{CURLcode, CURL, CURL_ERROR_SIZE};
 use itertools::{EitherOrBoth, Itertools};
+use libc::time_t;
 
 use crate::git::{BlobId, CommitId, GitObjectId, GitOid, RecursedTreeEntry};
 use crate::oid::{Abbrev, ObjectId};
@@ -228,6 +229,7 @@ pub struct object_info {
     disk_sizep: *mut u64,
     delta_base_oid: *mut object_id,
     contentp: *mut *mut c_void,
+    mtimep: *mut time_t,
     whence: c_int, // In reality, it's an inline enum.
     // In reality, following is a union with one struct.
     u_packed_pack: *mut c_void, // packed_git.
@@ -243,6 +245,7 @@ impl Default for object_info {
             disk_sizep: std::ptr::null_mut(),
             delta_base_oid: std::ptr::null_mut(),
             contentp: std::ptr::null_mut(),
+            mtimep: std::ptr::null_mut(),
             whence: 0,
             u_packed_pack: std::ptr::null_mut(),
             u_packed_offset: 0,
@@ -945,14 +948,32 @@ pub struct reference {
     flags: c_uint,
 }
 
+#[allow(dead_code, non_camel_case_types, clippy::upper_case_acronyms)]
+#[repr(C)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum refs_for_each_flag {
+    NONE = 0,
+}
+
+#[allow(non_camel_case_types)]
+#[repr(C)]
+pub struct refs_for_each_ref_options {
+    prefix: *const c_char,
+    pattern: *const c_char,
+    namespace: *const c_char,
+    exclude_patterns: *const *const c_char,
+    trim_prefix: usize,
+    flags: refs_for_each_flag,
+}
+
 extern "C" {
     pub fn get_main_ref_store(r: *mut repository) -> *mut ref_store;
 
-    pub fn refs_for_each_ref_in(
+    pub fn refs_for_each_ref_ext(
         refs: *const ref_store,
-        prefix: *const c_char,
         cb: unsafe extern "C" fn(*const reference, *mut c_void) -> c_int,
         cb_data: *mut c_void,
+        opts: *const refs_for_each_ref_options,
     ) -> c_int;
 }
 
@@ -964,7 +985,15 @@ pub fn for_each_ref_in<E, S: AsRef<OsStr>, F: FnMut(&OsStr, CommitId) -> Result<
 ) -> Result<(), E> {
     let _locked = REFS_LOCK.read().unwrap();
     let mut cb_data = (f, None);
-    let prefix = prefix.as_ref().to_cstring();
+    let c_prefix = prefix.as_ref().to_cstring();
+    let opts = refs_for_each_ref_options {
+        prefix: c_prefix.as_ptr(),
+        pattern: std::ptr::null(),
+        namespace: std::ptr::null(),
+        exclude_patterns: std::ptr::null(),
+        trim_prefix: prefix.as_ref().len(),
+        flags: refs_for_each_flag::NONE,
+    };
 
     unsafe extern "C" fn each_ref_cb<E, F: FnMut(&OsStr, CommitId) -> Result<(), E>>(
         r#ref: *const reference,
@@ -990,11 +1019,11 @@ pub fn for_each_ref_in<E, S: AsRef<OsStr>, F: FnMut(&OsStr, CommitId) -> Result<
     }
 
     unsafe {
-        if 0 == refs_for_each_ref_in(
+        if 0 == refs_for_each_ref_ext(
             get_main_ref_store(the_repository),
-            prefix.as_ptr(),
             each_ref_cb::<E, F>,
             &mut cb_data as *mut (F, Option<E>) as *mut c_void,
+            &opts,
         ) {
             Ok(())
         } else {
@@ -1208,7 +1237,7 @@ extern "C" {
 
     fn commit_list_count(l: *const commit_list) -> c_uint;
 
-    fn free_commit_list(list: *mut commit_list);
+    fn commit_list_free(list: *mut commit_list);
 
     fn commit_list_next(list: *const commit_list) -> *const commit_list;
 
@@ -1230,7 +1259,7 @@ impl CommitList {
 impl Drop for CommitList {
     fn drop(&mut self) {
         unsafe {
-            free_commit_list(self.list);
+            commit_list_free(self.list);
         }
     }
 }
