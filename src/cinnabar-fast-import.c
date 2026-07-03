@@ -137,6 +137,8 @@ struct object_entry *get_object_entry(const struct object_id *oid)
 	return NULL;
 }
 
+static void install_write_object_override(void);
+
 /* Mostly copied from fast-import.c's cmd_main() */
 static void init(void)
 {
@@ -163,6 +165,7 @@ static void init(void)
 	rc_free[cmd_save - 1].next = NULL;
 
 	start_packfile();
+	install_write_object_override();
 
 	parse_one_feature("force", 0);
 	initialized = 1;
@@ -263,15 +266,25 @@ void do_set_replace(const struct object_id *replaced,
 	}
 }
 
-int odb_source_loose_write_object(struct odb_source *source UNUSED, const void *buf, size_t len,
-                                  enum object_type type, struct object_id *oid,
-                                  struct object_id *compat_oid_in UNUSED, unsigned flags UNUSED)
+static int cinnabar_write_object(struct odb_source *source UNUSED, const void *buf,
+                                 unsigned long len, enum object_type type,
+                                 struct object_id *oid,
+                                 struct object_id *compat_oid UNUSED,
+                                 enum odb_write_object_flags flags UNUSED)
 {
 	struct strslice data;
 	data.buf = (void *)buf;
 	data.len = len;
 	store_git_object(type, data, oid, NULL, NULL);
 	return 0;
+}
+
+static void install_write_object_override(void)
+{
+       struct odb_source *source = the_repository->objects->sources;
+       if (!source || source->type != ODB_SOURCE_FILES)
+               BUG("expected primary odb source to be ODB_SOURCE_FILES");
+       source->write_object = cinnabar_write_object;
 }
 
 struct manifest_line {
