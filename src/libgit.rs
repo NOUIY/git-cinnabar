@@ -5,7 +5,7 @@
 use std::ffi::{c_void, CStr, CString, OsStr, OsString};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
-use std::os::raw::{c_char, c_int, c_long, c_uint, c_ulong, c_ushort};
+use std::os::raw::{c_char, c_int, c_long, c_uint, c_ushort};
 use std::ptr::{self, NonNull};
 use std::str::FromStr;
 use std::sync::RwLock;
@@ -228,7 +228,7 @@ pub enum object_type {
 #[repr(C)]
 pub struct object_info {
     typep: *mut object_type,
-    sizep: *mut c_ulong,
+    sizep: *mut usize,
     disk_sizep: *mut i64,
     delta_base_oid: *mut object_id,
     contentp: *mut *mut c_void,
@@ -353,7 +353,7 @@ pub fn git_object_info(
 ) -> Option<(object_type, Option<FfiBox<[u8]>>)> {
     let mut info = object_info::default();
     let mut t = object_type::OBJ_NONE;
-    let mut len: c_ulong = 0;
+    let mut len: usize = 0;
     let mut buf = std::ptr::null_mut();
     info.typep = &mut t;
     if with_content {
@@ -371,9 +371,7 @@ pub fn git_object_info(
         .then(|| {
             (
                 t,
-                with_content.then(|| unsafe {
-                    FfiBox::from_raw_parts(buf as *mut _, len.try_into().unwrap())
-                }),
+                with_content.then(|| unsafe { FfiBox::from_raw_parts(buf as *mut _, len) }),
             )
         })
 }
@@ -1084,6 +1082,21 @@ pub struct ref_transaction(c_void);
 #[repr(C)]
 pub struct ref_store(c_void);
 
+#[allow(dead_code, non_camel_case_types)]
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum ref_transaction_error {
+    OK = 0,
+    GENERIC = -1,
+    NAME_CONFLICT = -2,
+    CREATE_EXISTS = -3,
+    NONEXISTENT_REF = -4,
+    INCORRECT_OLD_VALUE = -5,
+    INVALID_NEW_VALUE = -6,
+    EXPECTED_SYMREF = -7,
+    CASE_CONFLICT = -8,
+}
+
 extern "C" {
     fn ref_store_transaction_begin(
         refs: *const ref_store,
@@ -1103,7 +1116,7 @@ extern "C" {
         flags: c_uint,
         msg: *const c_char,
         err: *mut strbuf,
-    ) -> c_int;
+    ) -> ref_transaction_error;
 
     fn ref_transaction_delete(
         tr: *mut ref_transaction,
@@ -1183,7 +1196,7 @@ impl RefTransaction {
                 &mut self.err,
             )
         };
-        let result = if ret == 0 {
+        let result = if ret == ref_transaction_error::OK {
             Ok(())
         } else {
             Err(self.err.as_bytes().to_str_lossy().to_string())

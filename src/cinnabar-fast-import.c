@@ -143,10 +143,11 @@ static void install_write_object_override(void);
 static void init(void)
 {
 	unsigned int i;
+	struct repo_config_values *cfg = repo_config_values(the_repository);
 
 	reset_pack_idx_option(&pack_idx_opts);
 	git_pack_config();
-	warn_on_object_refname_ambiguity = 0;
+	cfg->warn_on_object_refname_ambiguity = 0;
 
 	alloc_objects(object_entry_alloc);
 	atom_table_sz = 131071;
@@ -558,7 +559,7 @@ void store_replace_map(struct object_id *result) {
 }
 
 void unpack_object_entry(struct object_entry *oe, char **buf,
-                         unsigned long *len)
+                         size_t *len)
 {
 	// Note: ownership is given out.
 	*buf = gfi_unpack_entry(oe, len);

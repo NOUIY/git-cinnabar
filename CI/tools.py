@@ -16,7 +16,7 @@ from tasks import (
 from util import build_commit
 
 MERCURIAL_VERSION = "7.2"
-GIT_VERSION = "2.54.0"
+GIT_VERSION = "2.55.0"
 
 ALL_MERCURIAL_VERSIONS = (
     "1.9.3",
@@ -129,8 +129,8 @@ class Git(Task, metaclass=Tool):
                 )
                 + [
                     "make -C git -j$({}) install prefix=/ NO_GETTEXT=1"
-                    " NO_OPENSSL=1 NO_TCLTK=1 NO_UNCOMPRESS2=1 INSTALL_STRIP=-s"
-                    " DESTDIR=$PWD/git".format(nproc(build_image)),
+                    " NO_OPENSSL=1 NO_TCLTK=1 NO_UNCOMPRESS2=1 NO_RUST=1"
+                    " INSTALL_STRIP=-s DESTDIR=$PWD/git".format(nproc(build_image)),
                     "tar -c git | zstd -c > $ARTIFACTS/git-{}.tar.zst".format(version),
                 ],
                 artifact="git-{}.tar.zst".format(version),

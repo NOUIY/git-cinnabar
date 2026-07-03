@@ -392,6 +392,7 @@ void init_cinnabar(const char *argv0)
 int init_cinnabar_2(void)
 {
 	int nongit = 0;
+	struct repo_config_values *cfg;
 
 	// When GIT_DIR is set but the repository isn't fully initialized yet
 	// (e.g. during git clone with git 2.44.0), setup_git_directory_gently's
@@ -404,11 +405,12 @@ int init_cinnabar_2(void)
 		the_repository->objects = NULL;
 	}
 
-	setup_git_directory_gently(&nongit);
+	setup_git_directory_gently(the_repository, &nongit);
 	repo_config(the_repository, git_diff_basic_config, NULL);
 	cleanup_git_config(nongit);
 	save_commit_buffer = 0;
-	warn_on_object_refname_ambiguity = 0;
+	cfg = repo_config_values(the_repository);
+	cfg->warn_on_object_refname_ambiguity = 0;
 
 	if (!nongit) {
 		prepare_repo_settings(the_repository);
