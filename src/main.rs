@@ -174,7 +174,8 @@ extern "C" {
     #[cfg(windows)]
     fn wmain(argc: c_int, argv: *const *const u16) -> c_int;
 
-    fn init_cinnabar(argv0: *const c_char) -> c_int;
+    fn init_cinnabar(argv0: *const c_char);
+    fn init_cinnabar_2() -> c_int;
 }
 
 static REF_UPDATES: Lazy<Mutex<HashMap<Box<BStr>, CommitId>>> =
@@ -5213,6 +5214,15 @@ fn git_remote_hg(remote: OsString, mut url: OsString) -> Result<c_int, String> {
             }
             _ => {}
         }
+        // While e.g. git 2.44.0 doesn't materialize a full repository during
+        // git clone, by the time we reach here, it has. So if the first call
+        // to init_cinnabar_2 failed, we give it another try.
+        if !unsafe { HAS_GIT_REPO } {
+            unsafe {
+                HAS_GIT_REPO = init_cinnabar_2() != 0;
+            }
+            store = Lazy::new(the_store);
+        }
         let args = match cmd {
             b"import" | b"push" => args
                 .map(|a| a.as_bstr().to_boxed())
@@ -5311,7 +5321,8 @@ unsafe extern "C" fn cinnabar_main(_argc: c_int, argv: *const *const c_char) -> 
             );
         }
     }));
-    HAS_GIT_REPO = init_cinnabar(exe.as_deref().unwrap_or(argv0).as_ptr()) != 0;
+    init_cinnabar(exe.as_deref().unwrap_or(argv0).as_ptr());
+    HAS_GIT_REPO = init_cinnabar_2() != 0;
     logging::init(now);
     experiment(Experiments::MERGE);
 
