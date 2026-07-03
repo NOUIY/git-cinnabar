@@ -148,6 +148,7 @@ fn main() {
         .arg("NO_ICONV=1")
         .arg("USE_MIMALLOC=")
         .arg("FSMONITOR_DAEMON_BACKEND=")
+        .arg("FSMONITOR_OS_SETTINGS=")
         .arg("GENERATED_H=")
         .args(extra_args);
 
