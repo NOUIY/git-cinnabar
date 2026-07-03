@@ -13,7 +13,7 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - uses: actions/cache@v4
+    - uses: actions/cache@v5
       if: ${{ fromJSON(inputs.artifacts) }}
       id: cache
       with:
