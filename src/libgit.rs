@@ -12,6 +12,7 @@ use std::sync::RwLock;
 use std::time::{Duration, Instant};
 use std::{fmt, mem};
 
+use bitflags::bitflags;
 use bstr::ByteSlice;
 use cstr::cstr;
 use curl_sys::{CURLcode, CURL, CURL_ERROR_SIZE};
@@ -254,12 +255,26 @@ impl Default for object_info {
     }
 }
 
+bitflags! {
+    #[allow(non_camel_case_types)]
+    #[repr(transparent)]
+    #[derive(Debug, Copy, Clone)]
+    pub struct object_info_flags: c_uint {
+        const LOOKUP_REPLACE = 1 << 0;
+        const QUICK = 1 << 1;
+        const SKIP_FETCH_OBJECT = 1 << 2;
+        const DIE_IF_CORRUPT = 1 << 3;
+        const SECOND_READ = 1 << 4;
+        const FOR_PREFETCH = Self::SKIP_FETCH_OBJECT.bits() | Self::QUICK.bits();
+    }
+}
+
 extern "C" {
     fn odb_read_object_info_extended(
         r: *mut object_database,
         oid: *const object_id,
         oi: *mut object_info,
-        flags: c_uint,
+        flags: object_info_flags,
     ) -> c_int;
 }
 
@@ -344,7 +359,12 @@ pub fn git_object_info(
         info.contentp = &mut buf;
     }
     (unsafe {
-        odb_read_object_info_extended((*the_repository).objects, &oid.into().into(), &mut info, 0)
+        odb_read_object_info_extended(
+            (*the_repository).objects,
+            &oid.into().into(),
+            &mut info,
+            object_info_flags::empty(),
+        )
     } == 0)
         .then(|| {
             (
