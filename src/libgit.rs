@@ -166,6 +166,7 @@ pub struct slot_results {
     http_code: c_long,
     auth_avail: c_long,
     http_connectcode: c_long,
+    retry_after: c_long,
 }
 
 impl slot_results {
@@ -175,6 +176,7 @@ impl slot_results {
             http_code: 0,
             auth_avail: 0,
             http_connectcode: 0,
+            retry_after: 0,
         }
     }
 }
