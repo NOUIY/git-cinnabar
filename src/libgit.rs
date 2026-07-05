@@ -26,12 +26,12 @@ use crate::util::{CStrExt, DurationExt, ImmutBString, OptionExt, OsStrExt, Trans
 use crate::{check_enabled, experiment_similarity, logging, Checks};
 
 const GIT_MAX_RAWSZ: usize = 32;
-const GIT_HASH_SHA1: c_int = 1;
+const GIT_HASH_SHA1: c_uint = 1;
 
 #[allow(non_camel_case_types)]
 #[repr(C)]
 #[derive(Clone)]
-pub struct object_id([u8; GIT_MAX_RAWSZ], c_int);
+pub struct object_id([u8; GIT_MAX_RAWSZ], c_uint);
 
 impl object_id {
     pub fn as_raw_bytes(&self) -> &[u8] {
