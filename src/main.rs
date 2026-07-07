@@ -6,6 +6,7 @@
 #![allow(clippy::borrowed_box)]
 #![allow(clippy::missing_safety_doc)]
 #![allow(clippy::new_without_default)]
+#![allow(clippy::result_large_err)]
 #![deny(clippy::clone_on_ref_ptr)]
 #![deny(clippy::cloned_instead_of_copied)]
 #![deny(clippy::default_trait_access)]
@@ -1661,7 +1662,7 @@ fn do_reclone(store: &mut Store, rebase: bool) -> Result<(), String> {
                 .filter_map(|(_, _, (_, cid), (_, old_cid))| {
                     cid.map(|c| c.len())
                         .into_iter()
-                        .chain((old_cid.map(|c| c.len())).into_iter())
+                        .chain(old_cid.map(|c| c.len()))
                         .max()
                 })
                 .max()
@@ -5229,7 +5230,7 @@ fn git_remote_hg(remote: OsString, mut url: OsString) -> Result<c_int, String> {
                 .chain(
                     (&mut stdin)
                         .byte_lines()
-                        .take_while(|l| l.as_ref().map(|l| !l.is_empty()).unwrap_or(true))
+                        .take_while(|l| l.as_ref().map_or(true, |l| !l.is_empty()))
                         .map(|line| {
                             line.unwrap()
                                 .strip_prefix(cmd)
