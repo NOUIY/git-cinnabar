@@ -16,7 +16,7 @@ allow = [
   "MPL-2.0",
 ]
 exceptions = [
-    { allow = ["GPL-2.0"], crate = "git-cinnabar" },
+    { allow = ["GPL-2.0-only"], crate = "git-cinnabar" },
     { allow = ["Unicode-3.0"], crate = "unicode-ident" },
     { allow = ["Unicode-3.0"], crate = "icu_collections" },
     { allow = ["Unicode-3.0"], crate = "icu_locid" },
